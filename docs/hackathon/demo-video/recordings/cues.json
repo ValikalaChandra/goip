@@ -1,0 +1,50 @@
+[
+  {
+    "t": 0.0,
+    "name": "clock"
+  },
+  {
+    "t": 0.749,
+    "name": "overview"
+  },
+  {
+    "t": 22.751,
+    "name": "overview_counts"
+  },
+  {
+    "t": 38.855,
+    "name": "list"
+  },
+  {
+    "t": 52.979,
+    "name": "needs_review"
+  },
+  {
+    "t": 65.052,
+    "name": "stitch"
+  },
+  {
+    "t": 79.084,
+    "name": "scores"
+  },
+  {
+    "t": 99.116,
+    "name": "qa"
+  },
+  {
+    "t": 113.17,
+    "name": "switch_screen"
+  },
+  {
+    "t": 137.213,
+    "name": "settings"
+  },
+  {
+    "t": 151.26,
+    "name": "return"
+  },
+  {
+    "t": 161.262,
+    "name": "app_end"
+  }
+]

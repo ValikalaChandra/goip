@@ -1,0 +1,1 @@
+The rendered film is [demo-video/final-demo.mp4](demo-video/final-demo.mp4). It has no voice-over. The spoken pack is [demo-video/SCRIPT.md](demo-video/SCRIPT.md) and is not what the film plays. The film does not include a Telegram scene.

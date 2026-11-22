@@ -1,0 +1,91 @@
+{
+  "targets": {
+    "discovered": 200,
+    "screened": 100,
+    "researched": 50,
+    "priority": 15
+  },
+  "priority_floor": 10,
+  "qualify_score": 55,
+  "weights": {
+    "signal_strength": 25,
+    "technical_demand": 25,
+    "service_relevance": 20,
+    "timing": 15,
+    "accessibility": 10,
+    "evidence_quality": 5
+  },
+  "services": [
+    "AI and machine learning development",
+    "Agentic workflow automation",
+    "Data engineering and analytics",
+    "Backend and API development",
+    "Web application development",
+    "LLM integration and RAG",
+    "Cloud infrastructure and deployment",
+    "Software engineering consulting"
+  ],
+  "industries": [
+    "AI and machine learning",
+    "SaaS",
+    "FinTech",
+    "HealthTech",
+    "EdTech",
+    "E-commerce",
+    "Logistics",
+    "Cybersecurity",
+    "Enterprise software",
+    "Climate technology"
+  ],
+  "countries": ["United States", "United Kingdom", "Canada", "Europe", "India", "Singapore", "Australia"],
+  "schedule": {"hour": 18, "minute": 0, "timezone": "Asia/Kolkata"},
+  "models": {
+    "extraction": "openai/gpt-4.1-mini",
+    "research": "openai/gpt-4.1-mini",
+    "technical": "openai/gpt-4.1-mini",
+    "qualification": "openai/gpt-4.1-mini",
+    "qa": "openai/gpt-4.1-mini"
+  },
+  "model_fallbacks": ["openai/gpt-4o-mini", "google/gemini-2.5-flash"],
+  "fetch_caps": {
+    "hn_hits": 40,
+    "rss_per_feed": 12,
+    "github_hits": 8,
+    "crawl_queries": 1,
+    "crawl_pages": 1
+  },
+  "scoring_v2": {
+    "business_signal": {
+      "funding": 85,
+      "product": 70,
+      "hiring": 75,
+      "partnership": 60,
+      "expansion": 62,
+      "acquisition": 58,
+      "technology": 64,
+      "open_source": 55,
+      "other": 20,
+      "multi_signal_bonus": 8,
+      "no_quote": 10
+    },
+    "technical_evidence": {
+      "explicit_requirement": 85,
+      "engineering_vacancy": 78,
+      "architecture_disclosure": 70,
+      "api_requirement": 80,
+      "stated_ai_requirement": 75,
+      "repository_only": 40,
+      "ai_product_mention": 25,
+      "none": 0
+    },
+    "freelance_fit": {
+      "explicit_contract": 85,
+      "explicit_requirement_no_contract": 45,
+      "vacancy_no_outsourcing": 40,
+      "repository_only": 15,
+      "hypothesis_cap": 20,
+      "unsupported_service_delta": 0,
+      "none": 0
+    }
+  }
+}

@@ -1,0 +1,67 @@
+1
+00:00:00,000 --> 00:00:08,000
+I wanted a system that could help me spot a possible freelance lead
+without researching every company from a pile of tabs.
+
+2
+00:00:25,000 --> 00:00:40,000
+This is Global Opportunity Intelligence. Twenty-six companies are stored.
+Fifty-eight signals never became a company.
+
+3
+00:00:40,000 --> 00:00:55,000
+The high-priority count is 14, from the first scorer.
+Qualified, including that set, is 21. Needs review is 5.
+
+4
+00:00:55,000 --> 00:01:15,000
+This run already finished. Fourteen discovered, four researched, zero qualified.
+Switch says delivered. Telegram says delivered.
+
+5
+00:01:15,000 --> 00:01:35,000
+The targets are on the right. The shortfall is printed on purpose.
+I am not going to pretend this table is a run I just started.
+
+6
+00:01:35,000 --> 00:02:05,000
+Seven agents share the room. Discovery, research, technical reading,
+qualification, strategy, quality assurance, and the orchestrator I talk to.
+
+7
+00:02:05,000 --> 00:02:20,000
+The diagram is the shape. The table is stored messages,
+not a claim that every agent finished this run.
+
+8
+00:02:20,000 --> 00:02:40,000
+Switch is the room, not the model. Mattermost is where I type.
+
+9
+00:02:40,000 --> 00:03:15,000
+Here is the room, and here is an exchange that already happened.
+I am not going to read an old screenshot as if I typed it just now.
+
+10
+00:03:15,000 --> 00:03:45,000
+Telegram receives the report. Two completed runs have a delivered report.
+It does not email a company.
+
+11
+00:03:45,000 --> 00:04:10,000
+Stitch.ai is the lead I will not pitch. The historical score is still 76.
+The second reading is 70, 25, and a freelance fit of 0.
+
+12
+00:04:10,000 --> 00:04:30,000
+Quality assurance rejected the old service line.
+Approval records a decision. It does not send outreach.
+
+13
+00:04:30,000 --> 00:05:05,000
+The agents do the reading. Switch is where I can see them and stop them.
+The old labels are still on screen because I have not rewritten them.
+
+14
+00:05:05,000 --> 00:05:10,000
+Global Opportunity Intelligence. Built with Switch. #HowISwitch

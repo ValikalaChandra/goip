@@ -1,0 +1,6 @@
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/title.mp4'
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/app-before.mp4'
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/console.mp4'
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/app-after.mp4'
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/architecture.mp4'
+file '/Users/valikalasudeshchandra/Documents/Personal_exp/switch/goip/docs/hackathon/demo-video/rendered/end.mp4'

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GOIP</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <form id="login" class="panel">
+    <p class="eyebrow">Local operator</p>
+    <h1>GOIP</h1>
+    <p>Global Opportunity Intelligence. The token stays in an HttpOnly cookie for this browser session. Nothing on this page contacts a company.</p>
+    <input id="token" type="password" autocomplete="current-password" placeholder="Operator token" required>
+    <button class="primary" type="submit">Unlock</button>
+    <p id="login-error" class="bad"></p>
+  </form>
+  <div id="app" class="hidden app-frame">
+    <aside>
+      <div class="brand">
+        <div class="mark" aria-hidden="true">G</div>
+        <div>
+          <p class="eyebrow">GOIP</p>
+          <strong>Opportunity desk</strong>
+        </div>
+      </div>
+      <nav aria-label="Primary">
+        <button data-view="overview" class="active">Overview</button>
+        <button data-view="explorer">Opportunities</button>
+        <button data-view="reconciliation">Reconciliation</button>
+        <button data-view="activity">Switch</button>
+        <button data-view="sources">Sources</button>
+        <button data-view="settings">Settings</button>
+      </nav>
+    </aside>
+    <div class="shell">
+      <header class="top">
+        <div>
+          <p class="eyebrow">Switch room · evidence first</p>
+          <h1>Global Opportunity Intelligence</h1>
+          <p>Freelance research with the source attached to the claim. Seven agents work in Switch. Telegram carries the report. A person approves every next step.</p>
+        </div>
+        <button id="run" class="primary">Run research</button>
+      </header>
+      <main id="view"></main>
+    </div>
+  </div>
+  <script src="/evidence-format.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

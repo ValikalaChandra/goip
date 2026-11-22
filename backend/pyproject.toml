@@ -1,0 +1,39 @@
+[project]
+name = "goip"
+version = "0.1.0"
+description = "Global Opportunity Intelligence Platform"
+requires-python = ">=3.12"
+dependencies = [
+  "apscheduler>=3.10.4",
+  "fastapi>=0.115",
+  "feedparser>=6.0.11",
+  "httpx>=0.28",
+  "pydantic>=2.10",
+  "pydantic-settings>=2.6",
+  "psycopg[binary]>=3.2",
+  "sqlalchemy>=2.0.36",
+  "uvicorn>=0.32",
+  "websockets>=13",
+  "langgraph>=1.2.24",
+  "langgraph-checkpoint-postgres>=3.2.1",
+  "langsmith>=0.16.0",
+  "truststore>=0.10.5",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+  "live: calls real external services",
+]
+
+[tool.uv]
+package = false

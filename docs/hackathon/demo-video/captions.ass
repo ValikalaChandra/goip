@@ -1,0 +1,28 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&HCC2B2014,0,0,0,0,100,100,0,0,4,10,0,2,80,80,22,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:12.00,Caption,,0,0,0,,I built GOIP to turn scattered public signals into a lead I can refuse.\NThe decision stays with a person.
+Dialogue: 0,0:00:12.00,0:00:40.00,Caption,,0,0,0,,These cards are stored rows, read on 9 November 2026.\NTwenty-seven companies. Sixty-five signals are not linked to a company.
+Dialogue: 0,0:00:40.00,0:00:54.12,Caption,,0,0,0,,Historical score, business signal, technical evidence, and freelance fit\Nstay in separate columns.
+Dialogue: 0,0:00:54.12,0:01:06.20,Caption,,0,0,0,,Six leads are in review. The search is narrowed to Stitch.ai.\NOpening the row does not change it.
+Dialogue: 0,0:01:06.20,0:01:20.23,Caption,,0,0,0,,The historical score is still 76. That is the old composite.\NIt is not the result of the three later scores.
+Dialogue: 0,0:01:20.23,0:01:40.26,Caption,,0,0,0,,Business signal is 70. Technical evidence is 25. Freelance fit is 0.\NA launch can be notable and still not be a freelance job.
+Dialogue: 0,0:01:40.26,0:01:54.32,Caption,,0,0,0,,Quality assurance rejected the old service line, LLM integration and RAG.\NThe company stays in review. The company was not rejected.
+Dialogue: 0,0:01:54.32,0:02:16.32,Caption,,0,0,0,,FastAPI receives the page and the API calls.\NSwitch carries the room. It does not run the stage, and it is not the model.
+Dialogue: 0,0:02:16.32,0:02:38.32,Caption,,0,0,0,,A stage is one GOIP-TASK, work inside GOIP, then one GOIP-RESULT.\NThe seven agents are not seven models running at once.
+Dialogue: 0,0:02:38.32,0:02:58.32,Caption,,0,0,0,,Business 70, technical 25, and freelance fit 0 are separate.\NQuality assurance rejects the service line. The company stays in review.
+Dialogue: 0,0:02:58.32,0:03:16.32,Caption,,0,0,0,,This is the existing Switch room, recorded without typing.\NThe rows are stored stage messages. Nothing was sent for this film.
+Dialogue: 0,0:03:16.32,0:03:28.32,Caption,,0,0,0,,An earlier console recording, not this take.\NA person addressed the orchestrator. Strategy replied that no outreach was sent.
+Dialogue: 0,0:03:28.32,0:03:50.32,Caption,,0,0,0,,GOIP stores the same room activity. Seven agents are members.\NThe screen shows the latest stored rows. It is not a claim that every agent finished a new run.
+Dialogue: 0,0:03:50.32,0:04:02.32,Caption,,0,0,0,,Settings shows which integrations are configured.\NThe secret values are not on this page.
+Dialogue: 0,0:04:02.32,0:04:18.32,Caption,,0,0,0,,The older labels have not been rewritten with the three scores.\NDiscovery coverage is incomplete. That is the current limit, not a roadmap disguised as a feature.
+Dialogue: 0,0:04:18.32,0:04:32.32,Caption,,0,0,0,,The desk can research a company and still refuse to pitch it.\NSwitch is the room where that argument is visible.

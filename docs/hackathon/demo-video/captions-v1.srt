@@ -1,0 +1,110 @@
+1
+00:00:00,000 --> 00:00:12,000
+Global Opportunity Intelligence.
+A local desk that keeps the public source next to the claim.
+
+2
+00:00:12,000 --> 00:00:34,002
+The overview is stored data.
+Counts come from the database, not from a target.
+
+3
+00:00:34,002 --> 00:00:50,106
+Twenty-seven companies are stored. Ninety-two signals were collected.
+Sixty-five of those signals are not linked to a company.
+
+4
+00:00:50,106 --> 00:01:04,230
+Historical score, business signal, technical evidence, and freelance fit
+stay in separate columns.
+
+5
+00:01:04,230 --> 00:01:16,303
+Six leads are in review. The search is narrowed to Stitch.ai.
+Opening the row does not change it.
+
+6
+00:01:16,303 --> 00:01:30,335
+The historical score is still 76.
+That is the old composite, not the three-score result.
+
+7
+00:01:30,335 --> 00:01:50,367
+Business signal is 70. Technical evidence is 25. Freelance fit is 0.
+A launch is not yet a freelance job.
+
+8
+00:01:50,367 --> 00:02:04,421
+Quality assurance rejected the old service line.
+The company stays in review. Nothing was sent.
+
+9
+00:02:04,421 --> 00:02:14,421
+This is the existing Switch room.
+These messages were already stored. Nothing was typed or sent.
+
+10
+00:02:14,421 --> 00:02:24,421
+The orchestrator and the specialist agents share one thread.
+Switch is the collaboration layer.
+
+11
+00:02:24,421 --> 00:02:48,464
+GOIP stores the same room activity. The seven agents are members.
+These rows were already stored.
+
+12
+00:02:48,464 --> 00:03:02,511
+Settings shows which integrations are configured.
+The secret values are not on this page.
+
+13
+00:03:02,511 --> 00:03:12,513
+The older high-priority labels are still the first scorer.
+They have not been rewritten.
+
+14
+00:03:12,513 --> 00:03:20,263
+The operator uses the web application.
+FastAPI serves that page and the API.
+
+15
+00:03:20,263 --> 00:03:28,013
+Discovery code fetches Hacker News, TechCrunch, GitHub,
+and one Crawl4AI query.
+
+16
+00:03:28,013 --> 00:03:35,763
+Research and qualification call OpenRouter.
+Switch is not the model provider.
+
+17
+00:03:35,763 --> 00:03:43,513
+Seven agents are members of one room.
+The orchestrator is the one a person addresses.
+
+18
+00:03:43,513 --> 00:03:51,263
+The runtime posts stage messages into Switch
+and reads the replies.
+
+19
+00:03:51,263 --> 00:03:59,013
+PostgreSQL stores companies, signals, evaluations,
+reviews, and those messages.
+
+20
+00:03:59,013 --> 00:04:06,763
+Mattermost is attached by Switch as the human composer.
+GOIP does not call it.
+
+21
+00:04:06,763 --> 00:04:14,513
+A solid arrow is HTTP. A dashed arrow is a room message.
+The brown arrow is a database write.
+
+22
+00:04:14,513 --> 00:04:30,513
+GOIP keeps the source next to the claim.
+Switch is the room where that work is visible. No outreach was sent.
+
