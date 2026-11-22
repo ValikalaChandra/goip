@@ -2,6 +2,23 @@
 
 GOIP finds public business signals, researches the companies behind them, and asks a human to decide whether a freelance technical conversation is worth having. It does not email or message those companies.
 
+## What changed in this version
+
+- **Agents, not functions.** Each of the seven agents has a goal, tools it chooses from, a bounded loop, memory and a grounded answer. The orchestrator plans from your request, reviews discovery and reflects on the run. A dedicated freelance judge decides whether a posting is a company offering paid contract work (and vetoes job-seekers the keywords mistake for demand). See `docs/AGENT_ARCHITECTURE.md`. Without a model every agent runs its fixed policy and says so.
+- **LangGraph orchestrator.** The graph is the control plane; Switch mirrors each step and is the human channel. See `docs/AGENT_ARCHITECTURE.md`.
+- **Every agent answers humans** in its own role, from stored records only, behind the same guardrails (input size, outreach refusal, rate limit, tool allowlist, output scrub).
+- **Chat commands in the Switch room** (to the orchestrator): `run` / "bring me new leads", `status`, `focus on fintech`, `clear focus`, and exact-grammar `approve G…`, `reject G…`, `request research G…`, `draft outreach G…`. Free text goes to a model that can only pick run, status, focus or help. It can never approve or reject.
+- **Sector focus** (`fintech`, `healthtech`, `edtech`, `cybersecurity`, `logistics`, `climate`, `ecommerce`, `saas`, `ai`): adds sector feeds and filters the general feeds. Saved in `config/runtime.json`.
+- **Job boards:** Remotive and We Work Remotely, for engineering roles that state a contract or freelance engagement. Cached for 6 hours so the boards are not polled.
+- **Room replies are structured Markdown cards** (heading, labelled fields, tables, a next step), the same shape from every agent.
+- **Model health is visible:** if OpenRouter has no credit (HTTP 402) or rejects the key, the dashboard shows a banner and the room's `status` says so, instead of features quietly degrading.
+- **Freelance demand source:** contract/freelance requests in the latest Hacker News "Who is hiring?" thread (45-day freshness, negation filtered). These are the leads that can reach `freelance_evidence`.
+- **Reconciliation shows its reasoning:** for each unlinked signal, the checks that ran, the candidate company and the basis for it, why it is not a higher class, and what would confirm it. The 'Classify them now' button runs the matcher over signals it has not seen.
+- **Showcase page and a new dark desk** built with Lenis, GSAP + ScrollTrigger, Motion, AOS and a Vanta network background (all motion respects `prefers-reduced-motion`).
+- **LangSmith tracing** with mandatory redaction. **Security audit:** `docs/SECURITY_AUDIT.md`.
+
+Set `GOIP_ROOM_APPROVERS` in `.env` so only you can approve or reject from the room. If the Telegram chat is a **group**, also set `TELEGRAM_ALLOWED_USER_IDS`: in a group nobody can act unless listed.
+
 ## The problem
 
 A freelancer looking for AI, data, or software work has to watch news, funding notes, and product launches by hand. The useful question is not "who was mentioned today?" It is "what was published, what might it imply, and what should I review before I write to anyone?"
@@ -75,7 +92,7 @@ PYTHONPATH=. uv run python -m pytest tests -q
 PYTHONPATH=. uv run python -m app.main
 ```
 
-Open `http://127.0.0.1:8001` and sign in with `GOIP_API_TOKEN`. The token is read from the environment. It is not embedded in the page.
+Open `http://127.0.0.1:8001` for the showcase page, then `http://127.0.0.1:8001/app` for the desk, and sign in with `GOIP_API_TOKEN`. The token is read from the environment. It is not embedded in the page.
 
 Switch Console must already be running its local server. On this machine the agent API is `http://127.0.0.1:50990` and the gateway is `http://127.0.0.1:50990/gateway`. Agent keys are created once and stored in `goip/data/secrets/`, which is gitignored.
 
@@ -89,6 +106,21 @@ curl -X POST http://127.0.0.1:8001/api/runs \
 
 The daily job is 18:00 `Asia/Kolkata`, coalesced, one instance.
 
+## Run it in Docker
+
+```bash
+# Postgres already running on the host (as above)? Reuse it, do not start a second one:
+GOIP_DOCKER_DB_URL="postgresql+psycopg://goip:PASSWORD@host.docker.internal:5433/goip" ./scripts/docker-up.sh
+# Otherwise this starts the compose Postgres too:
+./scripts/docker-up.sh
+```
+
+Stop the host process first: the host API and the container cannot both hold port 8001, the Switch sockets and Telegram polling.
+
+**Behind a TLS-inspecting proxy** (the build fails with `UnknownIssuer`)? Export the proxy's *public* root certificate once:
+`./scripts/export-corp-ca.sh <part of its name>`. It is passed to the build as a build secret (it is not stored in any image layer)
+and mounted read-only at run time. `certs/*.pem` is git-ignored. The container runs as a non-root user with all capabilities dropped.
+
 ## Environment
 
 See `goip/.env.example`. Real values belong only in `goip/.env` (mode 600) or in Switch Console's own env file. The application reads `SWITCH_REGISTRATION_KEY`, then `goip/data/secrets/registration.key`, then `AGENT_REGISTRATION_TOKEN` from `SWITCH_ENV_FILE`.
@@ -97,7 +129,7 @@ See `goip/.env.example`. Real values belong only in `goip/.env` (mode 600) or in
 
 `cd goip/backend && PYTHONPATH=. uv run python -m pytest tests -q`
 
-13 tests passed on 8 November 2026. A later pass, on 9 November 2026, ran the same command and 34 tests passed. They cover extraction, scoring, prompt-injection text that must not change the score, CSV formula neutralization, private-URL rejection, Telegram chat authorization, and a mocked discovery funnel. They do not prove that Switch, Telegram, OpenRouter, or Crawl4AI are reachable.
+139 tests pass (22 November 2026). Earlier: 13 on 8 November, 34 on 9 November. They cover extraction, scoring, prompt-injection text that must not change the score, CSV formula neutralization, private-URL rejection, Telegram chat authorization, and a mocked discovery funnel. They do not prove that Switch, Telegram, OpenRouter, or Crawl4AI are reachable.
 
 ## Security controls that are in the code
 
@@ -141,4 +173,4 @@ High-priority count 15 is the configured cap, not evidence that 15 companies are
 
 ## Layout
 
-`backend/app` holds the API, pipeline, Switch runtime, and integrations. `frontend/` is a single page served by FastAPI. `config/runtime.json` holds targets, weights, and model names. Reports are written under `data/exports/`.
+`backend/app` holds the API, pipeline, Switch runtime, and integrations. `frontend/` is two static pages served by FastAPI: `index.html` (showcase) and `app.html` (the desk at `/app`). Third-party libraries are vendored in `frontend/vendor/` (see `VENDOR.md` there) because the Content-Security-Policy allows scripts only from this origin. `config/runtime.json` holds targets, weights, and model names. Reports are written under `data/exports/`.

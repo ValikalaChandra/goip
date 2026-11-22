@@ -32,6 +32,7 @@ def _sources_for(session: Session, opportunity: Opportunity, fetches: dict[str, 
                 "fetch_status": fetched.get("fetch_status") or "not_refetched",
                 "signal_type": signal.signal_type,
                 "live_text": fetched.get("live_text") or "",
+                "model_verdict": signal.classification,
             }
         )
     return sources
@@ -39,7 +40,7 @@ def _sources_for(session: Session, opportunity: Opportunity, fetches: dict[str, 
 
 def source_fingerprint(sources: list[dict]) -> str:
     payload = [
-        (source.get("source_id"), source.get("raw_text"), source.get("published_at"), source.get("fetch_status"))
+        (source.get("source_id"), source.get("raw_text"), source.get("published_at"), source.get("fetch_status"), source.get("model_verdict"))
         for source in sources
     ]
     return hashlib.sha256(json.dumps(payload).encode()).hexdigest()

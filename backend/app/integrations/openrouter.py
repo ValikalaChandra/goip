@@ -12,6 +12,41 @@ class OpenRouterError(RuntimeError):
     pass
 
 
+# What the last model call said, so a dead key or an empty balance is visible instead of silently degrading features.
+LLM_STATE: dict = {"ok": None, "reason": "not_checked", "http": None, "at": None, "model": None}
+
+_REASONS = {402: "out_of_credit", 401: "key_rejected", 403: "key_rejected", 429: "rate_limited"}
+
+
+def _record(ok: bool | None, usage: dict) -> None:
+    from datetime import datetime, timezone
+
+    reason = "ok" if ok else "unavailable"
+    http = None
+    if ok is None:
+        reason = "unconfigured"
+    elif not ok:
+        statuses = [a.get("status") for a in usage.get("attempts", []) if isinstance(a.get("status"), int)]
+        for code in (402, 401, 403, 429):  # the most actionable cause wins
+            if code in statuses:
+                reason, http = _REASONS[code], code
+                break
+    LLM_STATE.update({"ok": ok, "reason": reason, "http": http, "at": datetime.now(timezone.utc).isoformat(), "model": usage.get("model")})
+
+
+def llm_health() -> dict:
+    return dict(LLM_STATE)
+
+
+LLM_MESSAGES = {
+    "out_of_credit": "OpenRouter reports no credit (HTTP 402). Add credit at openrouter.ai/credits.",
+    "key_rejected": "OpenRouter rejected the API key. Check OPENROUTER_API_KEY.",
+    "rate_limited": "OpenRouter is rate limiting this key. Try again shortly.",
+    "unavailable": "The language model did not answer.",
+    "unconfigured": "No OpenRouter key is configured.",
+}
+
+
 async def complete_json(
     client: httpx.AsyncClient,
     *,
@@ -22,9 +57,12 @@ async def complete_json(
     user: str,
     site_url: str,
     app_name: str,
+    max_user_chars: int = 8000,
 ) -> tuple[dict[str, Any] | None, dict]:
     if not api_key:
-        return None, {"status": "unconfigured"}
+        usage = {"status": "unconfigured"}
+        _record(None, usage)
+        return None, usage
     models = [model, *fallbacks]
     usage: dict[str, Any] = {"status": "failed", "attempts": []}
     for candidate in models:
@@ -33,7 +71,7 @@ async def complete_json(
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": fence_untrusted(user)},
+                {"role": "user", "content": fence_untrusted(user, max_user_chars)},
             ],
             "response_format": {"type": "json_object"},
         }
@@ -75,7 +113,9 @@ async def complete_json(
                 "cost": token_usage.get("cost"),
             }
         )
+        _record(True, usage)
         return parsed, usage
+    _record(False, usage)
     return None, usage
 
 

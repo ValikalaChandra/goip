@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings, load_runtime
 from app.db import AgentMessage, PipelineRun, utcnow
 from app.discovery.sources import fetch_github
+from app.agents.format import NO_OUTREACH, card, cell, code, label, link, table
 from app.exports import write_report
 from app.integrations.switch_client import AGENT_SPECS, SwitchClient, load_agent_keys, load_room
 from app.integrations.telegram_api import send_document, send_message
@@ -35,6 +37,31 @@ from app.pipeline import (
 )
 
 log = logging.getLogger("goip.switch")
+
+_ID_FIELDS = ("sender_id", "sender_user_id", "user_id", "actor_id", "from_id", "author_id")
+_logged_fields = False
+
+
+def sender_key(payload: dict, sender_name: str) -> str:
+    """A stable identity for rate limiting. A display name can be changed; an id cannot, so prefer one when Switch sends it."""
+    global _logged_fields
+    if not _logged_fields:
+        _logged_fields = True
+        log.info("switch message payload fields: %s", sorted(payload))  # names only, never values
+    for field in _ID_FIELDS:
+        value = payload.get(field)
+        if value:
+            return f"id:{value}"
+    return f"name:{sender_name}"
+
+
+_COMMAND = re.compile(
+    r"^\W*(?:please\s+)?(approve|reject|request\s+(?:additional\s+)?research|more\s+research|"
+    r"draft\s+outreach|prepare\s+outreach|outreach\s+draft|write\s+a\s+draft)\b",
+    re.I,
+)
+_LEAD_ID = re.compile(r"\bG[0-9A-F]{8}\b", re.I)
+MAX_CONCURRENT_MESSAGES = 8
 
 
 def _message_row(session: Session, **kwargs) -> None:
@@ -58,6 +85,14 @@ class TeamRuntime:
         self.stop = asyncio.Event()
         self.last_error: str | None = None
         self.http = httpx.AsyncClient(follow_redirects=False, headers={"User-Agent": "GOIP/0.1"})
+        from app.agents.chat import RateLimiter
+
+        self.limiter = RateLimiter()
+        self.ingest_limiter = RateLimiter(limit=30)
+        self._message_slots = asyncio.Semaphore(MAX_CONCURRENT_MESSAGES)
+        self._review_task: asyncio.Task | None = None
+        self._run_task: asyncio.Task | None = None
+        self._last_run_end = 0.0
 
     async def close(self) -> None:
         self.stop.set()
@@ -143,16 +178,22 @@ class TeamRuntime:
 
     async def _on_message(self, name: str, payload: dict) -> None:
         try:
-            await self._handle_message(name, payload)
+            async with self._message_slots:
+                await self._handle_message(name, payload)
         except Exception:  # noqa: BLE001
             log.exception("switch message handler failed for %s", name)
 
     async def _handle_message(self, name: str, payload: dict) -> None:
         if not payload.get("addressed"):
             return
-        sender = payload.get("sender_name") or ""
-        if sender == name:
-            return
+        sender = (payload.get("sender_name") or "").strip()
+        if not sender or sender == name:
+            return  # unknown sender: fail closed
+        agent_names = {item[0] for item in AGENT_SPECS}
+        human = payload.get("sender_kind") == "user" or sender not in agent_names
+        key = sender_key(payload, sender)
+        if human and not self.ingest_limiter.allow(key):
+            return  # throttle before any database write
         raw_body = payload.get("body") or ""
         body = protocol_body(raw_body)
         with self.session_factory() as session:
@@ -166,16 +207,21 @@ class TeamRuntime:
                 correlation_id=payload.get("message_id"),
                 delivered="received",
             )
-        if payload.get("sender_kind") == "user" or (sender and sender not in {item[0] for item in AGENT_SPECS}):
-            await self._human(name, body, sender)
+        if human:
+            from app.agents.chat import strip_mentions
+
+            await self._human(name, strip_mentions(body), sender, key)
             return
-        if not body.startswith("GOIP-TASK"):
-            if body.startswith("GOIP-RESULT"):
-                stage = _field(body, "stage")
-                event = self.stage_events.get(stage)
-                self.stage_results[stage] = {"body": body}
-                if event:
-                    event.set()
+        if self.settings.goip_graph_enabled:
+            return  # the graph is the control plane; room protocol messages are never acted on
+        if body.startswith("GOIP-RESULT") and sender in agent_names:
+            stage = _field(body, "stage")
+            event = self.stage_events.get(stage)
+            self.stage_results[stage] = {"body": body}
+            if event:
+                event.set()
+            return
+        if not body.startswith("GOIP-TASK") or sender != "goip-orchestrator":
             return
         stage = _field(body, "stage")
         run_id = _field(body, "run_id")
@@ -275,13 +321,13 @@ class TeamRuntime:
             )
         return {"delivered": delivered, "error": error, "target_statuses": statuses}
 
-    async def collaborative_run(self, trigger: str = "manual") -> str:
+    async def collaborative_run(self, trigger: str = "manual", goal: str = "") -> str:
         if not self.connected or not self.room.get("id"):
             raise RuntimeError(self.last_error or "switch_not_connected")
         if self.settings.goip_graph_enabled:
             from app.graph import run_graph
 
-            return await run_graph(self.session_factory, self, trigger, self.settings)
+            return await run_graph(self.session_factory, self, trigger, self.settings, goal)
         return await self._legacy_collaborative_run(trigger)
 
     async def _legacy_collaborative_run(self, trigger: str = "manual") -> str:
@@ -399,8 +445,30 @@ class TeamRuntime:
             f"GOIP-RESULT v1\nrun_id: {run_id}\nstage: complete\nsummary: Report stored. Human review is required before outreach.",
         )
 
-    async def _human(self, name: str, body: str, sender: str) -> None:
+    async def _human(self, name: str, body: str, sender: str, key: str | None = None) -> None:
+        from app.agents.chat import (
+            ROLE_HELP,
+            current_focus,
+            guard_message,
+            parse_focus,
+            reply,
+            scrub_reply,
+            report_text,
+            status_text,
+            wants_focus,
+            wants_report,
+            wants_run,
+            wants_status,
+        )
+
         if name != "goip-orchestrator":
+            with self.session_factory() as session:
+                text = reply(name, body, key or sender, session, self.limiter)
+            await self._broadcast(name, text)
+            return
+        blocked = guard_message(name, body, key or sender, self.limiter)
+        if blocked:
+            await self._broadcast("goip-orchestrator", scrub_reply(blocked))
             return
         lowered = body.lower()
         if any(
@@ -411,84 +479,184 @@ class TeamRuntime:
                 "coordinate the relevant specialist",
             )
         ):
-            asyncio.create_task(self.single_company_review())
+            busy = (self._run_task and not self._run_task.done()) or (self._review_task and not self._review_task.done())
+            if busy:
+                await self._broadcast("goip-orchestrator", card("Already working", lead="A run or review is already in progress.", next_step="Wait for it to finish. I will post the result here."))
+                return
+            self._review_task = asyncio.create_task(self.single_company_review())
             return
-        if any(phrase in lowered for phrase in ("send the email", "send an email", "message them", "send outreach", "linkedin")):
-            await self._broadcast(
-                "goip-strategy",
-                "No external outreach was sent. A draft can be prepared only after the lead is approved, and sending stays a separate human action outside GOIP.",
-            )
+        term, clear = parse_focus(body)
+        if wants_focus(body) and not wants_run(body):
+            await self._broadcast("goip-orchestrator", await self._apply_focus(term, clear))
+            return
+        if wants_run(body):
+            if term and term != current_focus():
+                await self._broadcast("goip-orchestrator", await self._apply_focus(term, False))
+            await self._try_start_run(body)
+            return
+        if re.fullmatch(r"\W*(help|\?|commands|what can you do|what can i ask)\W*", lowered.strip()):
+            await self._broadcast("goip-orchestrator", scrub_reply(ROLE_HELP["goip-orchestrator"]))
+            return
+        if wants_report(body) and not wants_run(body):
+            with self.session_factory() as session:
+                text = report_text(session)
+            await self._broadcast("goip-orchestrator", text)
+            return
+        if wants_status(body):
+            with self.session_factory() as session:
+                text = status_text(session)
+            await self._broadcast("goip-orchestrator", text)
             return
         from sqlalchemy import select
 
         from app.db import Company, Opportunity, OutreachDraft, Signal
+        from app.guardrails import GuardrailViolation, check_status_transition, require
+        from app.review import apply_review
 
+        command = _COMMAND.match(body)
+        id_match = _LEAD_ID.search(body)
         with self.session_factory() as session:
-            public_id = next((token for token in body.split() if token.startswith("G") and len(token) >= 5), "")
-            lead = None
-            if public_id:
-                lead = session.scalar(select(Opportunity).where(Opportunity.public_id == public_id.strip(".,")))
+            if command:
+                # State-changing request: the message must START with the command, name the lead
+                # explicitly, and there is no fallback to "the top lead".
+                approvers = {a.strip().lower() for a in (self.settings.goip_room_approvers or "").split(",") if a.strip()}
+                if approvers and sender.lower() not in approvers and (key or "").lower() not in approvers:
+                    await self._broadcast("goip-orchestrator", card("Not allowed", lead="Only the configured approvers can change a lead from the room.", note="Nothing changed."))
+                    return
+                if not id_match:
+                    await self._broadcast("goip-orchestrator", card("Which lead?", lead="Name it so I never guess.", next_step="`approve G1A2B3C4D`"))
+                    return
+                lead = session.scalar(select(Opportunity).where(Opportunity.public_id == id_match.group(0).upper()))
+                if lead is None:
+                    await self._broadcast("goip-orchestrator", card("Unknown lead", lead=f"I have no lead {code(id_match.group(0).upper())}."))
+                    return
+                verb = re.sub(r"\s+", " ", command.group(1).lower())
+                company = session.get(Company, lead.company_id)
+                signals = session.scalars(
+                    select(Signal).where(Signal.company_id == lead.company_id, Signal.run_id == lead.run_id)
+                ).all()
+                try:
+                    if "research" in verb:
+                        apply_review(session, lead, "request_research", body[:500], actor="switch-user", channel="switch")
+                        await self._broadcast(
+                            "goip-orchestrator",
+                            card(f"Research requested · {code(lead.public_id)}", lead="Company research, technical intelligence and discovery have an open task.", note=NO_OUTREACH),
+                        )
+                    elif verb == "approve":
+                        apply_review(session, lead, "approve", body[:500], actor="switch-user", channel="switch")
+                        await self._broadcast("goip-orchestrator", card(f"Approved · {code(lead.public_id)}", lead="Approved for further consideration.", note=NO_OUTREACH, next_step=f"`draft outreach {lead.public_id}` prepares a draft. It is never sent."))
+                    elif verb == "reject":
+                        apply_review(session, lead, "reject", body[:500], actor="switch-user", channel="switch")
+                        await self._broadcast("goip-orchestrator", card(f"Rejected · {code(lead.public_id)}", lead="Research history is kept.", note=NO_OUTREACH))
+                    else:  # draft request
+                        if lead.status != "approved":
+                            await self._broadcast("goip-strategy", card(f"No draft · {code(lead.public_id)}", lead=f"The lead is {label(lead.status)}. I only draft for an approved lead, and I never send."))
+                            return
+                        require(check_status_transition(lead.status, "outreach_drafted", "switch-user"))
+                        draft = OutreachDraft(
+                            id=str(uuid.uuid4()),
+                            opportunity_id=lead.id,
+                            subject=f"Draft for {company.name if company else lead.public_id}",
+                            body=(
+                                f"Draft only, not sent. {company.name if company else 'The company'} has this observed signal: "
+                                f"{signals[0].summary if signals else 'unavailable'} ({signals[0].source_url if signals else 'no url'}). "
+                                f"A possible service to discuss is {lead.recommended_service or 'a scoped technical engagement'}. "
+                                "The technical need is an inference, not a published vacancy."
+                            ),
+                            sent=False,
+                        )
+                        lead.status = "outreach_drafted"
+                        session.add(draft)
+                        session.commit()
+                        await self._broadcast("goip-strategy", card(f"Draft only · {code(lead.public_id)}", quote=draft.body, note="Stored in GOIP. It was not sent and cannot be sent from here."))
+                except GuardrailViolation as exc:
+                    session.rollback()
+                    await self._broadcast("goip-orchestrator", card(f"Not allowed · {code(lead.public_id)}", lead=f"That change is not permitted from status {label(lead.status)}: {exc.verdict.rule.replace('_', ' ')}.", note="Nothing changed."))
+                return
+            if not id_match:
+                from app.agents.router import route_intent
+
+                routed = await route_intent(self.http, self.settings, body)
+                intent = routed["intent"]
+                if intent == "run":
+                    await self._try_start_run(body)
+                    return
+                if intent == "status":
+                    await self._broadcast("goip-orchestrator", status_text(session))
+                    return
+                if intent == "report":
+                    await self._broadcast("goip-orchestrator", report_text(session))
+                    return
+                if intent in {"focus", "clear_focus"}:
+                    await self._broadcast("goip-orchestrator", await self._apply_focus(routed["focus"], intent == "clear_focus"))
+                    return
+                if intent == "help":
+                    await self._broadcast("goip-orchestrator", scrub_reply(ROLE_HELP["goip-orchestrator"]))
+                    return
+            # Read-only follow-up (no write): an explicit id, else the highest-scored stored lead.
+            lead = session.scalar(select(Opportunity).where(Opportunity.public_id == id_match.group(0).upper())) if id_match else None
             if lead is None:
                 lead = session.scalar(select(Opportunity).order_by(Opportunity.score.desc()))
             if lead is None:
-                await self._broadcast("goip-orchestrator", "I have no stored opportunity to inspect yet.")
+                await self._broadcast("goip-orchestrator", card("Nothing stored yet", lead="I have no stored opportunity to inspect.", next_step="`run` to look for some."))
                 return
             company = session.get(Company, lead.company_id)
             signals = session.scalars(
                 select(Signal).where(Signal.company_id == lead.company_id, Signal.run_id == lead.run_id)
             ).all()
-            from app.review import apply_review
-
-            if any(phrase in lowered for phrase in ("request additional research", "request research", "more research")):
-                apply_review(session, lead, "request_research", body[:500], actor="switch-user", channel="switch")
-                await self._broadcast(
-                    "goip-orchestrator",
-                    f"{lead.public_id} has an open research task for company research, technical intelligence, and discovery. Nothing was sent to the company.",
-                )
-                return
-            if lowered.startswith("approve") or " approve " in f" {lowered} ":
-                apply_review(session, lead, "approve", body[:500], actor="switch-user", channel="switch")
-                await self._broadcast("goip-orchestrator", f"{lead.public_id} is approved for further consideration. Nothing was sent to the company.")
-                return
-            if "reject" in lowered:
-                apply_review(session, lead, "reject", body[:500], actor="switch-user", channel="switch")
-                await self._broadcast("goip-orchestrator", f"{lead.public_id} is rejected. Research history is retained. Nothing was sent.")
-                return
-            wants_draft = any(phrase in lowered for phrase in ("draft outreach", "prepare outreach", "outreach draft", "write a draft"))
-            if wants_draft:
-                if lead.status != "approved":
-                    await self._broadcast("goip-strategy", f"{lead.public_id} is {lead.status}. I will not draft outreach until it is approved, and I will not send it.")
-                    return
-                draft = OutreachDraft(
-                    id=str(uuid.uuid4()),
-                    opportunity_id=lead.id,
-                    subject=f"Draft for {company.name if company else lead.public_id}",
-                    body=(
-                        f"Draft only, not sent. {company.name if company else 'The company'} has this observed signal: "
-                        f"{signals[0].summary if signals else 'unavailable'} ({signals[0].source_url if signals else 'no url'}). "
-                        f"A possible service to discuss is {lead.recommended_service or 'a scoped technical engagement'}. "
-                        "The technical need is an inference, not a published vacancy."
-                    ),
-                    sent=False,
-                )
-                lead.status = "outreach_drafted"
-                session.add(draft)
-                session.commit()
-                await self._broadcast("goip-strategy", draft.body)
-                return
             source = signals[0].source_url if signals else ""
             quote = signals[0].evidence if signals else ""
+            first = signals[0] if signals else None
             await self._broadcast(
                 "goip-company-research",
-                (
-                    f"Follow-up for {lead.public_id} {company.name if company else ''}. "
-                    f"Observed: {quote[:500]} Source: {source}. "
-                    f"Inference, not a vacancy: {lead.technical_need}. "
-                    f"Recommended service: {lead.recommended_service}. "
-                    f"Confidence: {lead.confidence}. Score: {lead.score}. "
-                    "No external outreach was sent."
+                card(
+                    f"Follow-up · {company.name if company else ''} {code(lead.public_id)}",
+                    fields=[
+                        ("Source", link(first.source_name, first.source_url) if first else "none stored"),
+                        ("Inference, not a vacancy", lead.technical_need or "none stored"),
+                        ("Recommended service", lead.recommended_service or "none"),
+                        ("Confidence", lead.confidence),
+                    ],
+                    quote=re.sub(r"<[^>]+>", " ", (first.evidence or ""))[:400].strip() if first else None,
+                    note=NO_OUTREACH,
                 ),
             )
+
+    async def _apply_focus(self, term: str | None, clear: bool) -> str:
+        from app.agents.chat import set_focus
+
+        try:
+            return set_focus(None if clear else term)
+        except ValueError:
+            return "I could not change the focus. Nothing changed."
+
+    async def _try_start_run(self, goal: str = "") -> None:
+        from app.agents.chat import RUN_COOLDOWN_SECONDS
+
+        if (self._run_task is not None and not self._run_task.done()) or (
+            self._review_task is not None and not self._review_task.done()
+        ):
+            await self._broadcast("goip-orchestrator", card("Already running", lead="A run is already in progress.", next_step="I will post the new leads here when it finishes."))
+            return
+        wait = RUN_COOLDOWN_SECONDS - (asyncio.get_event_loop().time() - self._last_run_end)
+        if self._last_run_end and wait > 0:
+            await self._broadcast("goip-orchestrator", card("Cooling down", lead=f"The last run finished moments ago. Please wait about {int(wait)} seconds before starting another."))
+            return
+        self._run_task = asyncio.create_task(self._room_run(goal))
+
+    async def _room_run(self, goal: str = "") -> None:
+        from app.agents.chat import run_summary
+
+        await self._broadcast("goip-orchestrator", card("Run started", lead="Reading Hacker News, its hiring thread and the news feeds, then researching what is new.", note="No one will be contacted. Progress appears below."))
+        try:
+            run_id = await self.collaborative_run("switch-room", goal)
+            with self.session_factory() as session:
+                text = run_summary(session, run_id)
+        except Exception as exc:  # noqa: BLE001
+            text = card("Run could not start", lead=f"{exc.__class__.__name__}.", note="Nothing was sent.")
+        finally:
+            self._last_run_end = asyncio.get_event_loop().time()
+        await self._broadcast("goip-orchestrator", text)
 
     async def single_company_review(self) -> None:
         from app.db import Company, Opportunity
@@ -496,7 +664,7 @@ class TeamRuntime:
         with self.session_factory() as session:
             chosen = choose_stored_company(session)
             if chosen is None:
-                await self._broadcast("goip-orchestrator", "No stored company has a usable source. Nothing was contacted.")
+                await self._broadcast("goip-orchestrator", card("Nothing to review", lead="No stored company has a usable source.", note="Nothing was contacted."))
                 return
             opportunity, company, _signals = chosen
             opportunity_id = opportunity.id
@@ -506,7 +674,7 @@ class TeamRuntime:
             company_name = company.name
         await self._broadcast(
             "goip-orchestrator",
-            f"Starting an internal review of {company_name} ({public_id}), already in the database. No one will be contacted.",
+            card(f"Internal review · {company_name} {code(public_id)}", lead="Re-reading what is already stored with all six specialists.", note="No one will be contacted."),
         )
         stages = [
             ("review-retrieve", "goip-discovery"),
@@ -536,12 +704,12 @@ class TeamRuntime:
             except TimeoutError:
                 line = "timed out"
             contributions.append((agent, line))
-            await self._broadcast(agent, f"{company_name}: {line[:500]}")
+            await self._broadcast(agent, f"**{company_name}** · {line[:500]}")
         with self.session_factory() as session:
             opportunity = session.get(Opportunity, opportunity_id)
             company = session.get(Company, company_id)
             if opportunity is None or company is None:
-                await self._broadcast("goip-orchestrator", "The stored company disappeared before the report was written.")
+                await self._broadcast("goip-orchestrator", card("Review stopped", lead="The stored company disappeared before the report was written."))
                 return
             signals = _stored_signals(session, company.id)
             mark_awaiting_review(session, opportunity)
@@ -549,6 +717,9 @@ class TeamRuntime:
         await self._broadcast("goip-orchestrator", report)
 
     async def _broadcast(self, agent: str, content: str) -> None:
+        from app.guardrails import redact_pii, redact_secrets
+
+        content = redact_pii(redact_secrets(content or ""))[:6000]
         try:
             result = await self.client.post(self.http, agent, self.room["id"], content)
             delivered = "delivered" if result.get("ok") else "failed"
@@ -582,16 +753,12 @@ _STAGE_TIMEOUTS = {
 
 
 def _review_report(company, opportunity, signals, contributions: list[tuple[str, str]]) -> str:
-    evidence = []
-    for signal in signals[:4]:
-        quote = (signal.evidence or signal.summary or signal.title or "").replace("\n", " ").strip()
-        evidence.append(f"- {signal.signal_type} ({signal.source_name}): {quote[:280]} Source: {signal.source_url}")
-    if not evidence:
-        evidence.append("- No stored source was linked.")
-    agents = "\n".join(f"- {name}: {text[:400]}" for name, text in contributions)
+    evidence = [
+        [label(sig.signal_type), cell(sig.title or sig.summary, 60), link(sig.source_name, sig.source_url)]
+        for sig in signals[:4]
+    ]
     detail = opportunity.score_detail or {}
-    explanation = detail.get("explanation") or []
-    explained = " ".join(str(item) for item in explanation) or "No score explanation was stored."
+    explained = " ".join(str(item) for item in (detail.get("explanation") or [])) or "No score explanation was stored."
     questions = []
     if not company.website:
         questions.append("The company website was not stored.")
@@ -602,25 +769,24 @@ def _review_report(company, opportunity, signals, contributions: list[tuple[str,
     if not opportunity.oss_url:
         questions.append("No matching public repository was found in this search.")
     questions.append("The technical need is an inference. The sources do not show an open freelance contract.")
-    questions.append("A human still has to decide whether the evidence is worth any later contact.")
-    return (
-        f"Internal review of {company.name} ({opportunity.public_id}). Awaiting human review.\n"
-        "No one was contacted and no outreach was sent.\n\n"
-        f"Business model and products: {company.description or 'Not stated by the stored sources.'}\n"
-        f"Industry: {company.industry or 'not stated'}. Country: {company.country or 'not stated'}.\n\n"
-        "Evidence\n"
-        + "\n".join(evidence)
-        + "\n\nAgent contributions\n"
-        + agents
-        + "\n\n"
-        f"Opportunity score: {opportunity.score if opportunity.score is not None else 'not scored'}. "
-        f"Confidence: {opportunity.confidence}.\n"
-        f"{explained}\n"
-        f"Recommended service: {opportunity.recommended_service or 'not assigned'}.\n"
-        f"QA: {opportunity.qa_notes or 'not recorded'}\n\n"
-        "Unresolved questions\n"
-        + "\n".join(f"- {item}" for item in questions)
-        + f"\n\nStatus: {opportunity.status}. {opportunity.status_reason}"
+    questions.append("A person still has to decide whether the evidence is worth any later contact.")
+    return card(
+        f"Internal review · {company.name} {code(opportunity.public_id)}",
+        lead="Awaiting human review.",
+        fields=[
+            ("Business", company.description or "not stated by the stored sources"),
+            ("Industry / country", f"{company.industry or 'not stated'} / {company.country or 'not stated'}"),
+            ("Score", opportunity.score if opportunity.score is not None else "not scored"),
+            ("Confidence", opportunity.confidence),
+            ("Recommended service", opportunity.recommended_service or "not assigned"),
+            ("Why", explained[:400]),
+            ("QA", opportunity.qa_notes or "not recorded"),
+            ("Status", f"{label(opportunity.status)}. {opportunity.status_reason}"),
+        ],
+        grid=(table(["Type", "Headline", "Source"], evidence) if evidence else None)
+        + "\n\n**Agents**\n" + "\n".join(f"- `{n}`: {cell(t, 200)}" for n, t in contributions),
+        bullets=questions,
+        note=f"No one was contacted. {NO_OUTREACH}",
     )
 
 

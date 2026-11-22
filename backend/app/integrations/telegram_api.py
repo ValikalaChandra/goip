@@ -43,6 +43,23 @@ def authorized(chat_id: str | int, allowed: str) -> bool:
     return str(chat_id) == str(allowed) and bool(allowed)
 
 
+def authorized_message(message: dict, allowed_chat: str, allowed_users: str = "") -> bool:
+    """The chat must match, and the person must be allowed.
+
+    In a private chat the sender is the chat itself. In a group, every member shares the chat id, so a member
+    must also be on the allowlist; otherwise anyone who joins the group could approve leads and pull reports.
+    """
+    chat = message.get("chat") or {}
+    if not authorized(chat.get("id", ""), allowed_chat):
+        return False
+    sender = str((message.get("from") or {}).get("id", ""))
+    if not sender:
+        return False
+    if chat.get("type", "private") == "private":
+        return sender == str(chat.get("id"))
+    return sender in {u.strip() for u in (allowed_users or "").split(",") if u.strip()}
+
+
 def parse_command(text: str) -> tuple[str, str]:
     parts = (text or "").strip().split(maxsplit=1)
     if not parts or not parts[0].startswith("/"):

@@ -63,8 +63,11 @@ class SwitchClient:
         return response.status_code == 200 and response.json().get("status") == "ok"
 
     async def register_all(self, client: httpx.AsyncClient) -> dict:
+        missing = [name for name, _, _ in AGENT_SPECS if not (self.agent_keys.get(name) or {}).get("api_key")]
+        if not missing:
+            return self.agent_keys  # every agent already has its saved key: no registration key is needed
         if not self.registration_key:
-            raise RuntimeError("Switch registration key is not configured")
+            raise RuntimeError(f"Switch registration key is not configured, and {len(missing)} agent(s) are not registered yet")
         headers = {"Authorization": f"Bearer {self.registration_key}", "Content-Type": "application/json"}
         for name, display, description in AGENT_SPECS:
             if name in self.agent_keys and self.agent_keys[name].get("api_key"):

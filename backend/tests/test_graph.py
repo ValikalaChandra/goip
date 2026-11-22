@@ -27,7 +27,7 @@ def factory(tmp_path, monkeypatch):
 def _stub(monkeypatch, raw_items=3, calls=None):
     calls = calls if calls is not None else []
 
-    async def discover(session, http, settings, run):
+    async def discover(session, http, settings, run, **kw):
         calls.append("discover")
         return {"company_ids": [], "counts": {"raw_items": raw_items, "discovered": 0, "screened": 0}}
 

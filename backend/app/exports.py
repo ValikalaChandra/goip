@@ -29,6 +29,8 @@ def write_report(session: Session, run_id: str, report_date: str) -> ReportFile:
     json_path = EXPORT_DIR / f"{stem}.json"
     csv_path.write_text(csv_text, encoding="utf-8")
     json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    for written in (csv_path, json_path):
+        written.chmod(0o600)
     existing = session.scalar(select(ReportFile).where(ReportFile.run_id == run_id))
     if existing:
         existing.csv_path = str(csv_path)

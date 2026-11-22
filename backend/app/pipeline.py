@@ -17,10 +17,23 @@ from app.db import (
     StatusEvent,
     utcnow,
 )
+from app.discovery.gather import ALL_SOURCES, Gatherer, record_health as _record_health_row
+from app.discovery.names import name_unnamed
 from app.discovery.extract import RawItem, is_publisher, normalize_name, registrable_domain
-from app.discovery.sources import crawl4ai_scrape, crawl4ai_search, fetch_github, fetch_hacker_news, fetch_rss
+from app.discovery.sources import (
+    FOCUS_FEEDS,
+    crawl4ai_scrape,
+    crawl4ai_search,
+    fetch_github,
+    fetch_hacker_news,
+    fetch_hn_hiring,
+    fetch_job_boards,
+    fetch_rss,
+    matches_focus,
+)
 from app.integrations.openrouter import complete_json, quote_supported
 from app.scoring.engine import score_opportunity
+from app.guardrails import check_grounded_output
 from app.security.text import injection_flags
 
 CSV_HEADERS = [
@@ -53,6 +66,14 @@ CSV_HEADERS = [
     "Recommended Action",
     "Research Timestamp",
 ]
+
+
+def clean_model_fields(parsed) -> dict:
+    """The model's JSON is untrusted too: keep only the five expected string fields, capped."""
+    if not isinstance(parsed, dict):
+        return {}
+    caps = {"evidence_quote": 600, "industry": 200, "country": 120, "description": 1000, "inferred_need": 800}
+    return {k: v.strip()[:n] for k, n in caps.items() if isinstance((v := parsed.get(k)), str) and v.strip()}
 
 
 def _id() -> str:
@@ -157,66 +178,30 @@ def _add_signal(session: Session, run_id: str, item: RawItem, company: Company |
     return True
 
 
-async def discover(session: Session, http: httpx.AsyncClient, settings: Settings, run: PipelineRun) -> dict:
+async def discover(
+    session: Session,
+    http: httpx.AsyncClient,
+    settings: Settings,
+    run: PipelineRun,
+    sources: list[str] | None = None,
+    pool: list[RawItem] | None = None,
+    used: list[str] | None = None,
+    focus: str | None = None,
+) -> dict:
+    """Gather (all sources, a chosen list, or an already gathered pool) and turn the items into companies and signals."""
     runtime = load_runtime()
     caps = runtime["fetch_caps"]
+    gatherer = Gatherer(session, http, settings, run, sector=focus)
+    sector = gatherer.sector
+    used = list(used or [])
+    if pool is None:
+        pool, used = await gatherer.gather(list(sources) if sources else list(ALL_SOURCES))
+    named_by_model = await name_unnamed(http, settings, [i for i in pool if i.category != "hiring"], int(caps.get("name_llm_titles", 60)))
     raw_count = 0
     duplicate_signals = 0
-    hn_items, hn_error = await fetch_hacker_news(http, int(caps["hn_hits"]))
-    _record_health(
-        session,
-        run.id,
-        name="Hacker News",
-        parent_domain="news.ycombinator.com",
-        category="community",
-        access_method="hn_algolia_api",
-        status="degraded" if hn_error else "ok",
-        records=len(hn_items),
-        error=hn_error,
-    )
-    rss_items, rss_health = await fetch_rss(http, int(caps["rss_per_feed"]))
-    for row in rss_health:
-        _record_health(session, run.id, **row)
-    crawl_items: list[RawItem] = []
-    results, crawl_error = await crawl4ai_search(
-        http,
-        settings.crawl4ai_base_url,
-        settings.crawl4ai_api_key,
-        "startup raises funding AI product launch",
-    )
-    pages = 0
-    for result in results[: int(caps["crawl_pages"])]:
-        markdown, scrape_error = await crawl4ai_scrape(
-            http, settings.crawl4ai_base_url, settings.crawl4ai_api_key, result["url"]
-        )
-        if scrape_error:
-            crawl_error = scrape_error
-            continue
-        pages += 1
-        crawl_items.append(
-            RawItem(
-                source_name="Crawl4AI search",
-                source_url=result["url"],
-                title=result["title"],
-                excerpt=(markdown or result["snippet"])[:2000],
-                category="news",
-                access_method="crawl4ai",
-            ).prepare()
-        )
-    _record_health(
-        session,
-        run.id,
-        name="Crawl4AI",
-        parent_domain="api.crawl4ai.com",
-        category="extraction",
-        access_method="crawl4ai_cloud",
-        status="unconfigured" if crawl_error == "missing_api_key" else ("ok" if pages else "failed"),
-        records=len(crawl_items),
-        error=None if pages else crawl_error,
-    )
     companies: dict[str, Company] = {}
     seen: set[tuple[str, str]] = set()
-    for item in [*hn_items, *rss_items, *crawl_items]:
+    for item in pool:
         raw_count += 1
         company = _company_for(session, item)
         created = _add_signal(session, run.id, item, company, seen)
@@ -228,15 +213,18 @@ async def discover(session: Session, http: httpx.AsyncClient, settings: Settings
     screened_ids = []
     for company in companies.values():
         signals = session.scalars(select(Signal).where(Signal.company_id == company.id, Signal.run_id == run.id)).all()
-        useful = [signal for signal in signals if signal.signal_type != "other"]
-        if useful:
+        if any(signal.signal_type != "other" for signal in signals):
             screened_ids.append(company.id)
     run.counts = {
         "raw_items": raw_count,
         "duplicate_signals": duplicate_signals,
         "discovered": len(companies),
         "screened": len(screened_ids),
-        "unmatched_items": raw_count - sum(1 for item in [*hn_items, *rss_items, *crawl_items] if item.company_name),
+        "focus": sector,
+        "hiring_posts": sum(1 for i in pool if i.category == "hiring"),
+        "named_by_model": named_by_model,
+        "sources": used,
+        "unmatched_items": raw_count - sum(1 for item in pool if item.company_name),
     }
     session.commit()
     return {"company_ids": screened_ids, "counts": run.counts}
@@ -269,27 +257,73 @@ def _ensure_opportunity(session: Session, run: PipelineRun, company: Company) ->
     return opportunity
 
 
+def prepare_research(session: Session, run: PipelineRun, company_id: str):
+    """Everything a researcher needs for one company: the opportunity, its signals, and the evidence text."""
+    company = session.get(Company, company_id)
+    if company is None:
+        return None
+    opportunity = _ensure_opportunity(session, run, company)
+    signals = _signals_for(session, run.id, company.id)
+    evidence = "\n".join(f"{signal.title}\n{signal.evidence}\n{signal.source_url}" for signal in signals)
+    return company, opportunity, signals, evidence
+
+
+def apply_research(session: Session, company: Company, opportunity: Opportunity, signals: list[Signal], evidence: str, parsed: dict | None) -> bool:
+    """Store a research result. The quote must really occur in the evidence; otherwise the stored signal text is used.
+
+    `parsed` comes from a model (one-shot or an agent). It is never trusted: it is shape-checked and grounded here.
+    Returns whether the model's quote was accepted.
+    """
+    parsed = clean_model_fields(parsed)
+    facts = [
+        {"kind": "observed", "text": signal.summary or signal.title, "source_url": signal.source_url, "signal_type": signal.signal_type}
+        for signal in signals
+    ]
+    grounded = check_grounded_output("observed", parsed.get("evidence_quote", ""), evidence)
+    if parsed and not grounded.blocked:
+        quote = str(parsed["evidence_quote"])
+        if parsed.get("industry") and not company.industry:
+            company.industry = str(parsed["industry"])[:200]
+        if parsed.get("country") and not company.country:
+            company.country = str(parsed["country"])[:120]
+        if parsed.get("description") and not company.description:
+            company.description = str(parsed["description"])[:1000]
+    else:
+        quote = (signals[0].evidence if signals else "")[:400]
+    flags = injection_flags(evidence)
+    opportunity.facts = facts
+    opportunity.inferences = [
+        {
+            "kind": "inference",
+            "text": parsed.get("inferred_need")
+            or "A recent business signal may create implementation work, but the source does not say the company is hiring a freelancer.",
+            "grounded": not grounded.blocked,
+        }
+    ]
+    opportunity.technical_need = opportunity.inferences[0]["text"]
+    opportunity.technical_need_kind = "inference"
+    opportunity.limitations = (
+        "Industry, country, and technical need are incomplete where the source did not state them."
+        + (f" Source text contained instruction-like phrases and they were ignored: {flags}." if flags else "")
+    )
+    if quote:
+        opportunity.facts.append({"kind": "observed", "text": quote, "source_url": signals[0].source_url if signals else ""})
+    _set_status(session, opportunity, "researching", "Company research recorded from linked sources.", "goip-company-research")
+    opportunity.researched_at = utcnow()
+    return not grounded.blocked
+
+
 async def research(session: Session, http: httpx.AsyncClient, settings: Settings, run: PipelineRun, company_ids: list[str]) -> dict:
+    """The fixed policy: one model call per company, or the stored text when the model is unavailable."""
     runtime = load_runtime()
     limit = int(runtime["targets"]["researched"])
     chosen = company_ids[:limit]
     usage_rows = []
     for company_id in chosen:
-        company = session.get(Company, company_id)
-        if company is None:
+        prepared = prepare_research(session, run, company_id)
+        if prepared is None:
             continue
-        opportunity = _ensure_opportunity(session, run, company)
-        signals = _signals_for(session, run.id, company.id)
-        evidence = "\n".join(f"{signal.title}\n{signal.evidence}\n{signal.source_url}" for signal in signals)
-        facts = [
-            {
-                "kind": "observed",
-                "text": signal.summary or signal.title,
-                "source_url": signal.source_url,
-                "signal_type": signal.signal_type,
-            }
-            for signal in signals
-        ]
+        company, opportunity, signals, evidence = prepared
         parsed, usage = await complete_json(
             http,
             api_key=settings.openrouter_api_key,
@@ -305,36 +339,7 @@ async def research(session: Session, http: httpx.AsyncClient, settings: Settings
             user=evidence,
         )
         usage_rows.append(usage)
-        quote = ""
-        if parsed and quote_supported(str(parsed.get("evidence_quote") or ""), evidence):
-            quote = str(parsed["evidence_quote"])
-            if parsed.get("industry") and not company.industry:
-                company.industry = str(parsed["industry"])[:200]
-            if parsed.get("country") and not company.country:
-                company.country = str(parsed["country"])[:120]
-            if parsed.get("description") and not company.description:
-                company.description = str(parsed["description"])[:1000]
-        else:
-            quote = (signals[0].evidence if signals else "")[:400]
-        flags = injection_flags(evidence)
-        opportunity.facts = facts
-        opportunity.inferences = [
-            {
-                "kind": "inference",
-                "text": (parsed or {}).get("inferred_need")
-                or "A recent business signal may create implementation work, but the source does not say the company is hiring a freelancer.",
-            }
-        ]
-        opportunity.technical_need = opportunity.inferences[0]["text"]
-        opportunity.technical_need_kind = "inference"
-        opportunity.limitations = (
-            "Industry, country, and technical need are incomplete where the source did not state them."
-            + (f" Source text contained instruction-like phrases and they were ignored: {flags}." if flags else "")
-        )
-        if quote:
-            opportunity.facts.append({"kind": "observed", "text": quote, "source_url": signals[0].source_url if signals else ""})
-        _set_status(session, opportunity, "researching", "Company research recorded from linked sources.", "goip-company-research")
-        opportunity.researched_at = utcnow()
+        apply_research(session, company, opportunity, signals, evidence, parsed)
     counts = dict(run.counts or {})
     counts["researched"] = len(chosen)
     run.counts = counts
@@ -524,7 +529,8 @@ async def refresh_company_research(
         ),
         user=evidence,
     )
-    if parsed and quote_supported(str(parsed.get("evidence_quote") or ""), evidence):
+    parsed = clean_model_fields(parsed)
+    if parsed and not check_grounded_output("observed", parsed.get("evidence_quote", ""), evidence).blocked:
         if parsed.get("industry") and not company.industry:
             company.industry = str(parsed["industry"])[:200]
         if parsed.get("country") and not company.country:

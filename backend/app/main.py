@@ -11,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app.api import SessionFactory, app, handle_telegram_text
 from app.config import get_settings, load_runtime
 from app.db import upgrade, make_engine
-from app.integrations.telegram_api import authorized
+from app.integrations.telegram_api import authorized, authorized_message
 from app.switch_runtime import build_runtime, set_runtime
 
 log = logging.getLogger("goip")
@@ -38,17 +38,49 @@ async def _telegram_loop(stop: asyncio.Event) -> None:
                 await asyncio.sleep(5)
                 continue
             for update in payload.get("result") or []:
-                offset = int(update["update_id"]) + 1
-                message = update.get("message") or {}
-                chat = message.get("chat") or {}
-                if not authorized(chat.get("id", ""), settings.telegram_chat_id):
-                    continue
-                text = await handle_telegram_text(message.get("text") or "", str(chat.get("id")))
-                if text:
-                    await client.post(
-                        f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                        json={"chat_id": settings.telegram_chat_id, "text": text[:4000]},
-                    )
+                try:
+                    offset = int(update["update_id"]) + 1
+                    message = update.get("message") or {}
+                    chat = message.get("chat") or {}
+                    if not authorized_message(message, settings.telegram_chat_id, settings.telegram_allowed_user_ids):
+                        continue
+                    text = await handle_telegram_text(message.get("text") or "", str(chat.get("id")))
+                    if text:
+                        await client.post(
+                            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                            json={"chat_id": settings.telegram_chat_id, "text": text[:4000]},
+                        )
+                except Exception as exc:  # noqa: BLE001 - one bad update must not stop the bot
+                    log.warning("telegram update failed: %s", exc.__class__.__name__)
+                    if isinstance(update, dict) and "update_id" in update:
+                        offset = max(offset, int(update["update_id"]) + 1)
+
+
+async def _probe_llm() -> None:
+    """One tiny model call at startup so an empty balance or a bad key shows up immediately, not after a run."""
+    from app.config import load_runtime
+    from app.integrations.openrouter import complete_json
+
+    settings = get_settings()
+    try:
+        runtime = load_runtime()
+        async with httpx.AsyncClient() as client:
+            await complete_json(
+                client,
+                api_key=settings.openrouter_api_key,
+                model=runtime["models"]["extraction"],
+                fallbacks=[],
+                site_url=settings.openrouter_site_url,
+                app_name=settings.openrouter_app_name,
+                system='Reply with exactly {"ok": true}',
+                user="ping",
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("model probe failed: %s", exc.__class__.__name__)
+    from app.integrations.openrouter import llm_health
+
+    state = llm_health()
+    log.info("model probe: ok=%s reason=%s http=%s", state["ok"], state["reason"], state["http"])
 
 
 async def _scheduled_run() -> None:
@@ -77,6 +109,8 @@ async def startup() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     upgrade(make_engine())
     settings = get_settings()
+    if 0 < len(settings.goip_api_token) < 24:
+        log.warning("GOIP_API_TOKEN is shorter than 24 characters; use a long random token")
     if settings.goip_use_system_certs:
         import truststore
 
@@ -112,6 +146,7 @@ async def startup() -> None:
         scheduler.start()
         app.state.scheduler = scheduler
     app.state.telegram = asyncio.create_task(_telegram_loop(stop))
+    app.state.llm_probe = asyncio.create_task(_probe_llm())
 
 
 @app.on_event("shutdown")

@@ -57,10 +57,49 @@ _STATED_AI = re.compile(
 _AI_PRODUCT = re.compile(r"\b(ai assistant|artificial intelligence|powered by ai)\b", re.I)
 _HIRING = re.compile(r"\b(hiring|job opening|open role|engineer role|we(?:'re| are) hiring)\b", re.I)
 _FREELANCE = re.compile(
-    r"\b(freelance|freelancer|contractor|consulting engagement|external consultant|"
-    r"looking for a consultant|outsourc\w*)\b",
+    r"\b(freelanc\w*|contractors?|consulting engagement|external consultant|"
+    r"looking for a consultant|outsourc\w*|contract (?:role|basis|position|work|engagement|to hire)|short[- ]term contract)\b",
     re.I,
 )
+_NEGATED = re.compile(
+    r"\b(?:no|not|never|without|don'?t|do not|doesn'?t|does not|won'?t|will not|isn'?t|aren'?t|cannot|can'?t|nor)\b"
+    r"(?:\s+\w+){0,4}?\s+(?:freelanc\w*|contractors?|consultants?|outsourc\w*)",
+    re.I,
+)
+
+
+POSTERS = ("company", "individual_seeker", "recruiter", "unknown")
+ENGAGEMENTS = ("contract", "freelance", "part_time", "full_time", "unclear")
+
+
+def valid_verdict(verdict: object, raw: str) -> dict | None:
+    """A reviewer-model verdict is evidence only if it is well formed and, when it claims a contract offer, quotes the
+    posting word for word. This runs again at evaluation time, so a stored verdict can never outlive its source text."""
+    if not isinstance(verdict, dict):
+        return None
+    try:
+        out = {
+            "is_freelance_opportunity": bool(verdict["is_freelance_opportunity"]),
+            "poster": verdict["poster"], "engagement": verdict["engagement"], "work": verdict["work"],
+            "confidence": verdict.get("confidence", "low"), "quote": str(verdict.get("quote") or "").strip(),
+            "reasoning": str(verdict.get("reasoning") or "").strip()[:400],
+        }
+    except (KeyError, TypeError):
+        return None
+    if out["poster"] not in POSTERS or out["engagement"] not in ENGAGEMENTS or out["work"] not in ("engineering", "other"):
+        return None
+    if out["confidence"] not in ("low", "medium", "high"):
+        out["confidence"] = "low"
+    if out["is_freelance_opportunity"] and (not out["quote"] or not quote_supported(out["quote"], raw)):
+        return None
+    return out
+
+
+def _freelance_stated(text: str) -> bool:
+    """A freelance/contract request that is not negated ('we do not hire freelancers' does not count)."""
+    return bool(_FREELANCE.search(text)) and not _NEGATED.search(text)
+
+
 _LAUNCH = re.compile(r"\b(launch(?:es|ed|ing)?|announces|introduces|unveils|show hn)\b", re.I)
 _FUNDING = re.compile(r"\b(raises?|raised|series [a-e]|seed round|funding)\b", re.I)
 _PARTNER = re.compile(r"\b(partner(?:s|ship|ed)?)\b", re.I)
@@ -89,12 +128,19 @@ _TECHNICAL_RANK = {
 }
 
 
+# Bump when the evaluation LOGIC changes (not just its numbers), so stored leads are read again and the
+# earlier reading stays in the immutable history. 2: whitespace-tolerant quote check, negation-aware freelance match.
+# 3: 'contract role/basis/position/engagement' counts as an explicit contract request.
+# 4: a validated reviewer-model verdict can confirm or veto explicit contract evidence (it never sets a score).
+SCORING_LOGIC_VERSION = "4"
+
+
 def scoring_config_version(runtime: dict | None = None) -> str:
     """Identity of the ranking configuration. A change here means a new reading, not a new science."""
     import hashlib
     import json
 
-    payload = json.dumps(scoring_config(runtime), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps({"logic": SCORING_LOGIC_VERSION, "config": scoring_config(runtime)}, sort_keys=True, separators=(",", ":"))
     return "scoring_v2-" + hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
@@ -264,7 +310,26 @@ def evaluate(sources: list[dict], *, runtime: dict | None = None, historical_ser
         technical_kinds.append(kind)
         if kind in {"explicit_requirement", "api_requirement", "stated_ai_requirement", "engineering_vacancy"}:
             requirement_texts.append(text)
-        if _FREELANCE.search(text):
+        explicit = _freelance_stated(text)
+        verdict = valid_verdict(source.get("model_verdict"), raw)
+        if verdict:
+            company_offer = verdict["is_freelance_opportunity"] and verdict["poster"] == "company" and verdict["work"] == "engineering"
+            if company_offer:
+                explicit = True
+                findings.append(finding(claim=f"The posting states: {verdict['quote']}", classification="observed_fact", source_id=str(source.get("source_id") or ""),
+                                        source_url=source.get("source_url") or "", quotation=verdict["quote"], published_at=published, retrieved_at=retrieved,
+                                        confidence=verdict["confidence"], fetch_status=fetch_status, raw_text=raw))
+                findings.append(finding(claim=f"A reviewer model read this as a company offering {verdict['engagement']} engineering work: {verdict['reasoning']}",
+                                        classification="inference", source_id=str(source.get("source_id") or ""), source_url=source.get("source_url") or "",
+                                        published_at=published, retrieved_at=retrieved, confidence=verdict["confidence"], fetch_status=fetch_status))
+            elif explicit and verdict["confidence"] != "low" and (
+                not verdict["is_freelance_opportunity"] or verdict["poster"] == "individual_seeker" or verdict["engagement"] in ("full_time", "part_time")
+            ):
+                explicit = False  # the wording matched, but a reviewer read it as something else (a job-seeker, a full-time role)
+                findings.append(finding(claim=f"A reviewer model judged this is not a company offering a contract ({verdict['poster'].replace('_', ' ')}, {verdict['engagement'].replace('_', ' ')}): {verdict['reasoning']}",
+                                        classification="inference", source_id=str(source.get("source_id") or ""), source_url=source.get("source_url") or "",
+                                        published_at=published, retrieved_at=retrieved, confidence=verdict["confidence"], fetch_status=fetch_status))
+        if explicit:
             freelance_kind = "explicit_contract"
         if kind == "ai_product_mention":
             findings.append(

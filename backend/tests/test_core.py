@@ -135,8 +135,11 @@ async def test_discovery_dedupes_and_keeps_funnel_order(tmp_path, monkeypatch):
     upgrade(engine)
     factory = make_session_factory(engine)
 
+    # Names resolve to a fixed public address, and requests connect to that address with the name in the Host header.
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))])
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if "hn.algolia.com" in str(request.url):
+        if "hn.algolia.com" in request.headers.get("host", ""):
             return httpx.Response(
                 200,
                 json={
@@ -191,3 +194,25 @@ def _settings():
         goip_scheduler_enabled=False,
         goip_telegram_polling=False,
     )
+
+
+# ---- Telegram: in a group, the chat id is shared by every member, so the person must be allowed too
+def test_telegram_private_chat_must_be_the_owner():
+    from app.integrations.telegram_api import authorized_message
+
+    me = {"chat": {"id": 123456789, "type": "private"}, "from": {"id": 123456789}}
+    assert authorized_message(me, "123456789")
+    assert not authorized_message({"chat": {"id": 123456789, "type": "private"}, "from": {"id": 555}}, "123456789")
+    assert not authorized_message({"chat": {"id": 1, "type": "private"}, "from": {"id": 1}}, "123456789")  # wrong chat
+    assert not authorized_message({"chat": {"id": 123456789}}, "123456789")  # no sender
+    assert not authorized_message(me, "")  # empty allowlist fails closed
+
+
+def test_telegram_group_members_need_to_be_listed():
+    from app.integrations.telegram_api import authorized_message
+
+    group = {"chat": {"id": -100123, "type": "supergroup"}, "from": {"id": 777}}
+    assert not authorized_message(group, "-100123")  # nobody listed: nobody may act
+    assert not authorized_message(group, "-100123", "111,222")
+    assert authorized_message(group, "-100123", "111, 777")
+    assert not authorized_message({"chat": {"id": -100123, "type": "group"}, "from": {"id": 888}}, "-100123", "777")

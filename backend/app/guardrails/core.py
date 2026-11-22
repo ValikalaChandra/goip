@@ -48,6 +48,23 @@ _PHONE = re.compile(r"(?<!\d)(?:\+?\d[\s-]?){9,14}\d(?!\d)")
 MAX_INPUT_CHARS = 20_000
 
 
+_SECRET_VALUES = re.compile(
+    r"(sk-[A-Za-z0-9_-]{16,}|lsv2_[A-Za-z0-9_]{10,}|\b\d{8,10}:AA[\w-]{30,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"Bearer\s+\S+|\b[A-Za-z0-9_-]{40,}\b)"
+)
+
+
+def _is_url_slug(token: str) -> bool:
+    """A long lowercase-hyphen word run like an article slug is not a credential."""
+    return token.count("-") >= 3 and re.fullmatch(r"[a-z0-9-]+", token) is not None
+
+
+def redact_secrets(text: str) -> str:
+    """Remove token-shaped strings. Long opaque tokens are redacted even if their vendor is unknown,
+    except readable URL slugs, which would otherwise corrupt every long article link."""
+    return _SECRET_VALUES.sub(lambda m: m.group(0) if _is_url_slug(m.group(0)) else "[redacted]", text or "")
+
+
 def redact_pii(text: str) -> str:
     """Remove personal contact data before text reaches a model or a trace."""
     return _PHONE.sub("[phone]", _EMAIL.sub("[email]", text or ""))
@@ -77,13 +94,15 @@ def check_source_url(url: str, *, resolve=None) -> Verdict:
 # ----------------------------------------------------------------- tool layer
 
 AGENT_TOOLS: dict[str, frozenset[str]] = {
-    "goip-discovery": frozenset({"fetch_and_group"}),
-    "goip-company-research": frozenset({"llm_extract_all"}),
-    "goip-technical-intelligence": frozenset({"search_and_attach"}),
-    "goip-qualification": frozenset({"score_all"}),
-    "goip-strategy": frozenset(),
-    "goip-quality-assurance": frozenset({"audit_all"}),
-    "goip-orchestrator": frozenset({"post_room_message", "write_report", "send_report_to_operator"}),
+    # Perception tools only read. `submit_verdicts` is the single narrow write an agent has: it validates every
+    # verdict against the posting's own text before storing it, and a verdict is never a score.
+    "goip-discovery": frozenset({"fetch_and_group", "read_store", "list_sources", "fetch_source", "source_stats"}),
+    "goip-company-research": frozenset({"llm_extract_all", "read_store", "read_signals", "fetch_stored_page", "quote_check"}),
+    "goip-technical-intelligence": frozenset({"search_and_attach", "read_store", "github_search", "github_repo", "read_company"}),
+    "goip-qualification": frozenset({"score_all", "read_store", "list_postings", "reviewer_examples", "submit_verdicts"}),
+    "goip-strategy": frozenset({"read_store", "read_evaluation", "list_services"}),
+    "goip-quality-assurance": frozenset({"audit_all", "read_store", "read_evaluation", "read_opportunity", "recheck_source"}),
+    "goip-orchestrator": frozenset({"post_room_message", "write_report", "send_report_to_operator", "read_store", "source_stats", "read_trace"}),
 }
 
 # No agent, under any prompt, may hold a tool that contacts a third party.
@@ -151,7 +170,8 @@ def check_status_transition(current: str | None, target: str, actor: str) -> Ver
 # -------------------------------------------------------------- outreach layer
 
 _OUTREACH = re.compile(
-    r"(send (the |an? )?(email|message|dm)|message them|send outreach|linkedin|cold (email|call)|contact (them|the company))",
+    r"(send (the |an? |a )?(email|mail|message|dm|note)|(e-?mail|dm|ping|text|call|write to|get in touch with|reach out to|reach out) (them|the (ceo|founder|company|team))|"
+    r"message them|send outreach|linkedin|cold (email|call)|contact (them|the company))",
     re.I,
 )
 

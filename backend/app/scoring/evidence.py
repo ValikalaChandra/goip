@@ -30,13 +30,26 @@ def registrable_domain(url: str) -> str:
     return host
 
 
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
 def quote_supported(quote: str, raw: str) -> bool:
-    """True when the quotation is copied from the raw source or its decoded form."""
+    """True when the quotation is copied from the raw source or its decoded form.
+
+    Differences in whitespace only (a line break shown as a space) do not make a quotation unsupported,
+    but every word must still occur in the source in order.
+    """
     if not quote or not raw:
         return False
     decoded_quote = decode_text(quote).strip()
+    if not decoded_quote:
+        return False  # a blank quotation is "contained" in everything, so it never counts as evidence
     decoded_raw = decode_text(raw)
-    return quote in raw or decoded_quote in decoded_raw
+    if quote in raw or decoded_quote in decoded_raw:
+        return True
+    squashed = _squash(decoded_quote)
+    return bool(squashed) and squashed in _squash(decoded_raw)
 
 
 def finding(

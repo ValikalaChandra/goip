@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import hmac
+import re
+import secrets
+import time
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from app.config import GOIP_ROOT, get_settings, load_runtime, save_runtime
+from app.guardrails import GuardrailViolation, check_status_transition, require
 from app.db import (
     AgentMessage,
     Company,
@@ -37,6 +41,7 @@ from app.reconciliation import apply_human_action
 from app.scoring.evidence import decode_text
 from app.scoring.v2 import _service_supported
 from app.exports import read_export, write_report
+from app.integrations.openrouter import LLM_MESSAGES, llm_health
 from app.integrations.telegram_api import authorized, get_me, parse_command, send_document, send_message
 from app.pipeline import discover, qualify, quality_check, research, shortfall
 from app.discovery.sources import fetch_github
@@ -70,8 +75,79 @@ class ReconciliationBody(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class RunBody(BaseModel):
+    goal: str = Field(default="", max_length=300)
+
+
 class RuntimeBody(BaseModel):
     values: dict
+
+
+SESSION_TTL = 60 * 60 * 12
+_SESSIONS: dict[str, float] = {}
+_MAX_SESSIONS = 50
+
+
+def _new_session() -> str:
+    now = time.time()
+    for key in [k for k, exp in _SESSIONS.items() if exp < now]:
+        _SESSIONS.pop(key, None)
+    while len(_SESSIONS) >= _MAX_SESSIONS:
+        _SESSIONS.pop(min(_SESSIONS, key=_SESSIONS.get), None)
+    sid = secrets.token_urlsafe(32)
+    _SESSIONS[sid] = now + SESSION_TTL
+    return sid
+
+
+def _valid_session(sid: str) -> bool:
+    exp = _SESSIONS.get(sid or "")
+    if exp is None:
+        return False
+    if exp < time.time():
+        _SESSIONS.pop(sid, None)
+        return False
+    return True
+
+
+class LoginThrottle:
+    """Per-client lockout: 5 failures lock that client for 5 minutes, doubling on repeat."""
+
+    def __init__(self, limit: int = 5, base_lock: float = 300.0, max_clients: int = 500, clock=time.monotonic):
+        self.limit, self.base_lock, self.max_clients, self.clock = limit, base_lock, max_clients, clock
+        self._state: dict[str, list] = {}  # client -> [failures, locked_until, lock_count]
+
+    def retry_after(self, client: str) -> int:
+        entry = self._state.get(client)
+        if not entry:
+            return 0
+        return max(0, int(entry[1] - self.clock()))
+
+    def failure(self, client: str) -> None:
+        if client not in self._state and len(self._state) >= self.max_clients:
+            self._state.pop(next(iter(self._state)), None)
+        entry = self._state.setdefault(client, [0, 0.0, 0])
+        entry[0] += 1
+        if entry[0] >= self.limit:
+            entry[2] += 1
+            entry[1] = self.clock() + self.base_lock * (2 ** (entry[2] - 1))
+            entry[0] = 0
+
+    def success(self, client: str) -> None:
+        self._state.pop(client, None)
+
+
+_login_throttle = LoginThrottle()
+
+
+def _client_id(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _token_ok(presented: str, expected: str) -> bool:
+    # Compare digests so neither length nor content leaks through timing.
+    import hashlib
+
+    return hmac.compare_digest(hashlib.sha256(presented.encode()).digest(), hashlib.sha256(expected.encode()).digest())
 
 
 def _authorized(request: Request) -> None:
@@ -81,11 +157,22 @@ def _authorized(request: Request) -> None:
         raise HTTPException(status_code=503, detail="GOIP_API_TOKEN is not configured")
     header = request.headers.get("authorization", "")
     presented = header[7:].strip() if header.lower().startswith("bearer ") else ""
-    cookie = request.cookies.get("goip_session", "")
-    header_ok = bool(presented) and len(presented) == len(expected) and hmac.compare_digest(presented, expected)
-    cookie_ok = bool(cookie) and len(cookie) == len(expected) and hmac.compare_digest(cookie, expected)
-    if not header_ok and not cookie_ok:
-        raise HTTPException(status_code=401, detail="Authentication required")
+    if presented and _token_ok(presented, expected):
+        return
+    if _valid_session(request.cookies.get("goip_session", "")):
+        return
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _allowed_hosts() -> set[str]:
+    return {h.strip().lower() for h in get_settings().goip_allowed_hosts.split(",") if h.strip()}
+
+
+def _host_only(value: str) -> str:
+    value = (value or "").strip().lower()
+    if value.startswith("["):
+        return value.split("]")[0] + "]"
+    return value.split(":")[0]
 
 
 def _status_counts(session: Session) -> list[dict]:
@@ -101,12 +188,36 @@ def create_app() -> FastAPI:
     upgrade(engine)
 
     @app.middleware("http")
+    async def request_guard(request: Request, call_next):
+        # DNS-rebinding defence: only answer to the hostnames we expect.
+        if _host_only(request.headers.get("host", "")) not in _allowed_hosts():
+            return JSONResponse({"detail": "Host not allowed"}, status_code=400)
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            if origin and origin != "null":
+                from urllib.parse import urlparse
+
+                if (urlparse(origin).hostname or "").lower() not in {h.strip("[]") for h in _allowed_hosts()}:
+                    return JSONResponse({"detail": "Cross-origin request refused"}, status_code=403)
+                if urlparse(origin).netloc.lower() != request.headers.get("host", "").lower():
+                    return JSONResponse({"detail": "Cross-origin request refused"}, status_code=403)
+            elif origin == "null":
+                return JSONResponse({"detail": "Cross-origin request refused"}, status_code=403)
+            if request.url.path.startswith("/api/") and "application/json" not in request.headers.get("content-type", "").lower():
+                return JSONResponse({"detail": "Content-Type must be application/json"}, status_code=415)
+        return await call_next(request)
+
+    @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            # Pages and assets change between versions. Revalidate (cheap 304) so a browser never mixes an old
+            # script or stylesheet with a new page.
+            response.headers["Cache-Control"] = "no-cache"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
         return response
 
     @app.get("/health")
@@ -119,15 +230,31 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/login")
-    def login(body: LoginBody, response: Response):
+    def login(body: LoginBody, request: Request, response: Response):
         settings = get_settings()
-        if not settings.goip_api_token or len(body.token) != len(settings.goip_api_token) or not hmac.compare_digest(body.token, settings.goip_api_token):
+        client = _client_id(request)
+        wait = _login_throttle.retry_after(client)
+        if wait:
+            raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {wait} seconds.", headers={"Retry-After": str(wait)})
+        if not settings.goip_api_token or not _token_ok(body.token, settings.goip_api_token):
+            _login_throttle.failure(client)
             raise HTTPException(status_code=401, detail="Invalid token")
-        response.set_cookie("goip_session", settings.goip_api_token, httponly=True, samesite="lax", secure=False, max_age=60 * 60 * 12)
+        _login_throttle.success(client)
+        response.set_cookie("goip_session", _new_session(), httponly=True, samesite="strict", secure=False, max_age=SESSION_TTL)
         return {"ok": True}
 
+    @app.get("/api/session")
+    def session_state(request: Request):
+        """Is this browser signed in? Always answers 200, so the login screen produces no console error."""
+        header = request.headers.get("authorization", "")
+        presented = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        expected = get_settings().goip_api_token
+        ok = bool(expected) and ((bool(presented) and _token_ok(presented, expected)) or _valid_session(request.cookies.get("goip_session", "")))
+        return {"authenticated": ok}
+
     @app.post("/api/logout")
-    def logout(response: Response):
+    def logout(request: Request, response: Response):
+        _SESSIONS.pop(request.cookies.get("goip_session", ""), None)
         response.delete_cookie("goip_session")
         return {"ok": True}
 
@@ -142,6 +269,7 @@ def create_app() -> FastAPI:
         countries = session.execute(select(Company.country, func.count()).group_by(Company.country)).all()
         switch = get_runtime()
         return {
+            "llm": {**llm_health(), "message": LLM_MESSAGES.get(llm_health()["reason"], "")},
             "companies": session.scalar(select(func.count()).select_from(Company)) or 0,
             "qualified": session.scalar(select(func.count()).select_from(Opportunity).where(Opportunity.status.in_(["qualified", "high_priority", "approved"]))) or 0,
             "high_priority": session.scalar(select(func.count()).select_from(Opportunity).where(Opportunity.status == "high_priority")) or 0,
@@ -170,21 +298,33 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/opportunities")
-    def opportunities(request: Request, session: Session = Depends(db), q: str = "", status: str = "", signal: str = ""):
+    def opportunities(
+        request: Request,
+        session: Session = Depends(db),
+        q: str = "",
+        status: str = "",
+        signal: str = "",
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
         _authorized(request)
-        rows = session.scalars(select(Opportunity).order_by(Opportunity.score.desc())).all()
+        stmt = select(Opportunity).join(Company, Company.id == Opportunity.company_id)
+        if q:
+            stmt = stmt.where(func.lower(Company.name).contains(q.lower()))
+        if status:
+            stmt = stmt.where(Opportunity.status == status)
+        if signal:
+            stmt = stmt.where(
+                exists().where(Signal.company_id == Opportunity.company_id, Signal.run_id == Opportunity.run_id, Signal.signal_type == signal)
+            )
+        total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        rows = session.scalars(stmt.order_by(Opportunity.score.desc(), Opportunity.public_id).limit(limit).offset(offset)).all()
         payload = []
         for item in rows:
             company = session.get(Company, item.company_id)
             signals = session.scalars(select(Signal).where(Signal.company_id == item.company_id, Signal.run_id == item.run_id)).all()
-            if q and q.lower() not in (company.name or "").lower():
-                continue
-            if status and item.status != status:
-                continue
-            if signal and not any(row.signal_type == signal for row in signals):
-                continue
             payload.append(_opportunity_summary(item, company, signals, session))
-        return {"opportunities": payload}
+        return {"opportunities": payload, "total": total, "limit": limit, "offset": offset}
 
     @app.get("/api/opportunities/{public_id}")
     def opportunity_detail(public_id: str, request: Request, session: Session = Depends(db)):
@@ -236,6 +376,10 @@ def create_app() -> FastAPI:
             "signals": [
                 {
                     "id": signal.id,
+                    "title": decode_text(signal.title or ""),
+                    "parent_domain": signal.parent_domain,
+                    "category": signal.category,
+                    "discussion_url": _discussion_url(signal),
                     "source_name": signal.source_name,
                     "source_url": signal.source_url,
                     "signal_type": signal.signal_type,
@@ -257,34 +401,95 @@ def create_app() -> FastAPI:
         item = _lead(session, public_id)
         from app.review import apply_review
 
-        result = apply_review(session, item, body.action, body.note, actor="operator", channel="dashboard")
+        try:
+            result = apply_review(session, item, body.action, body.note, actor="operator", channel="dashboard")
+        except GuardrailViolation as exc:
+            session.rollback()
+            raise HTTPException(status_code=409, detail=f"Not allowed from status {item.status}: {exc.verdict.rule.replace('_', ' ')}") from None
         return {"ok": True, "outreach_sent": False, **result}
 
     @app.get("/api/reconciliation")
     def reconciliation(request: Request, session: Session = Depends(db)):
         _authorized(request)
-        rows = session.scalars(select(SignalReconciliation).order_by(SignalReconciliation.created_at)).all()
+        from app.reconciliation import CLASS_MEANING, _companies, classify_signal
+
+        rows = session.scalars(select(SignalReconciliation).order_by(SignalReconciliation.created_at.desc())).all()
+        companies = _companies(session)
+        linked = {}
+        for sig in session.scalars(select(Signal).where(Signal.company_id.is_not(None))).all():
+            if sig.source_url:
+                linked.setdefault(sig.source_url, set()).add(sig.id)
+        signal_counts = dict(session.execute(select(Signal.company_id, func.count()).where(Signal.company_id.is_not(None)).group_by(Signal.company_id)).all())
+        lead_for = {}
+        for opp in session.scalars(select(Opportunity).order_by(Opportunity.run_id)).all():
+            lead_for[opp.company_id] = (opp.public_id, opp.status)
         payload = []
         for row in rows:
             signal = session.get(Signal, row.signal_id)
             company = session.get(Company, row.candidate_company_id) if row.candidate_company_id else None
+            # Re-derive the reasoning from the current data. A signal's own URL does not count as "already stored".
+            others = {url for url, ids in linked.items() if ids - {row.signal_id}}
+            fresh = classify_signal(
+                title=signal.title if signal else "",
+                identity_hint=signal.identity_hint if signal else "",
+                source_url=signal.source_url if signal else "",
+                companies=companies,
+                linked_urls=others,
+            )
+            reasoning = fresh["reasoning"]
+            candidate = reasoning.get("candidate")
+            if candidate is None and company is not None:
+                candidate = {"id": company.id, "name": company.name, "domain": company.domain, "basis": "person" if row.human_action else None}
+            if candidate:
+                lead = lead_for.get(candidate["id"])
+                candidate = {**candidate, "stored_signals": int(signal_counts.get(candidate["id"], 0)), "lead_id": lead[0] if lead else None, "lead_status": lead[1] if lead else None}
             payload.append(
                 {
                     "signal_id": row.signal_id,
                     "classification": row.classification,
+                    "classification_now": fresh["classification"],
                     "confidence": row.confidence,
                     "rationale": row.rationale,
                     "method": row.method,
                     "human_action": row.human_action,
+                    "decided_by": row.actor if row.human_action else None,
                     "candidate_company_id": row.candidate_company_id,
                     "candidate_company": company.name if company else None,
                     "title": signal.title if signal else "",
                     "source_name": signal.source_name if signal else "",
                     "source_url": signal.source_url if signal else "",
                     "linked_company_id": signal.company_id if signal else None,
+                    "signal_type": signal.signal_type if signal else "",
+                    "excerpt": decode_text((signal.evidence or "")[:320]) if signal else "",
+                    "published_at": signal.published_at.isoformat() if signal and signal.published_at else None,
+                    "classified_at": row.created_at.isoformat() if row.created_at else None,
+                    "class_meaning": CLASS_MEANING.get(row.classification, ""),
+                    "reasoning": {**reasoning, "candidate": candidate},
                 }
             )
-        return {"signals": payload}
+        counts = {}
+        for item in payload:
+            counts[item["classification"]] = counts.get(item["classification"], 0) + 1
+        classified_ids = {row.signal_id for row in rows}
+        unclassified = sum(
+            1 for sig in session.scalars(select(Signal).where(Signal.company_id.is_(None))).all() if sig.id not in classified_ids
+        )
+        return {
+            "unclassified": unclassified,
+            "signals": payload,
+            "counts": counts,
+            "total": len(payload),
+            "stored_companies": len(companies),
+            "needs_person": sum(1 for p in payload if not p["human_action"] and p["classification"] in {"probable_match", "ambiguous_match"}),
+        }
+
+    @app.post("/api/reconciliation/inspect")
+    def reconciliation_inspect(request: Request, session: Session = Depends(db)):
+        """Classify every unlinked signal that has no row yet. Only a domain match links a signal on its own."""
+        _authorized(request)
+        from app.reconciliation import record_inspection
+
+        return record_inspection(session)
 
     @app.post("/api/reconciliation/{signal_id}")
     def reconcile(signal_id: str, body: ReconciliationBody, request: Request, session: Session = Depends(db)):
@@ -326,6 +531,10 @@ def create_app() -> FastAPI:
             ),
             sent=False,
         )
+        try:
+            require(check_status_transition(item.status, "outreach_drafted", "operator"))
+        except GuardrailViolation as exc:
+            raise HTTPException(status_code=409, detail=exc.verdict.rule.replace("_", " ")) from None
         item.status = "outreach_drafted"
         session.add(draft)
         session.commit()
@@ -394,14 +603,31 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/runs")
-    async def start_run(request: Request, session: Session = Depends(db)):
+    async def start_run(request: Request, body: RunBody | None = None, session: Session = Depends(db)):
         _authorized(request)
+        goal = " ".join((body.goal if body else "").split())
         runtime = get_runtime()
         if runtime and runtime.connected and runtime.room.get("id"):
-            run_id = await runtime.collaborative_run("dashboard")
+            run_id = await runtime.collaborative_run("dashboard", goal)
             return {"run_id": run_id, "mode": "switch"}
-        run_id = await _local_run(session)
+        run_id = await _local_run(session, goal)
         return {"run_id": run_id, "mode": "local_switch_offline"}
+
+    @app.get("/api/runs/{run_id}/trace")
+    def run_trace(run_id: str, request: Request, session: Session = Depends(db)):
+        """How each agent decided during a run: its reasoning, the tools it chose, what it saw, and whether the model or the fixed policy did it."""
+        _authorized(request)
+        from app.agents import memory
+
+        run = session.scalar(select(PipelineRun).order_by(PipelineRun.started_at.desc())) if run_id == "latest" else session.get(PipelineRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        counts = dict(run.counts or {})
+        return {
+            "run_id": run.id, "status": run.status, "started_at": run.started_at.isoformat() if run.started_at else None,
+            "modes": counts.get("agent_modes") or {}, "sources": counts.get("sources") or [], "judged": counts.get("judged"),
+            "trace": memory.trace_for(session, run.id),
+        }
 
     @app.get("/api/runs/{run_id}/export.csv")
     def export_csv(run_id: str, request: Request, session: Session = Depends(db)):
@@ -429,6 +655,11 @@ def create_app() -> FastAPI:
         return {"status": "authenticated", "username": identity.get("username")}
 
     frontend = GOIP_ROOT / "frontend"
+
+    @app.get("/app", include_in_schema=False)
+    def dashboard_page():
+        return FileResponse(frontend / "app.html")
+
     if frontend.exists():
         app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
     return app
@@ -446,6 +677,8 @@ def _report_for(session: Session, run_id: str):
 
     report = session.scalar(select(ReportFile).where(ReportFile.run_id == run_id))
     if report is None:
+        if session.get(PipelineRun, run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found")
         zone = ZoneInfo(load_runtime()["schedule"]["timezone"])
         report = write_report(session, run_id, datetime.now(zone).date().isoformat())
     return report
@@ -496,6 +729,17 @@ def _evaluation_payload(row: EvaluationVersion, decisions: list[HumanDecision] |
     }
 
 
+_DISCUSSION = re.compile(r"https://news\.ycombinator\.com/item\?id=\d+")
+
+
+def _discussion_url(signal: Signal) -> str | None:
+    """The Hacker News discussion for a story, when the stored feed text links to it. Never the same as the source."""
+    found = _DISCUSSION.search(decode_text(signal.evidence or ""))
+    if found and found.group(0) != signal.source_url:
+        return found.group(0)
+    return None
+
+
 def _opportunity_summary(item: Opportunity, company: Company | None, signals: list[Signal], session: Session | None = None) -> dict:
     latest = None
     if session is not None:
@@ -517,6 +761,8 @@ def _opportunity_summary(item: Opportunity, company: Company | None, signals: li
         "qa_verdict": latest.qa_verdict if latest else None,
         "signal": signals[0].signal_type if signals else None,
         "source_url": signals[0].source_url if signals else None,
+        "source_name": signals[0].source_name if signals else None,
+        "headline": decode_text(signals[0].title or "") if signals else None,
         "service": item.recommended_service,
         "service_supported": _service_supported(item.recommended_service or "", [row.evidence or "" for row in signals]),
         "commercial_intent": assess_commercial_intent([row.evidence or row.title or "" for row in signals]),
@@ -526,12 +772,12 @@ def _opportunity_summary(item: Opportunity, company: Company | None, signals: li
     }
 
 
-async def _local_run(session: Session) -> str:
+async def _local_run(session: Session, goal: str = "") -> str:
     settings = get_settings()
     if settings.goip_graph_enabled:
         from app.graph import run_graph
 
-        return await run_graph(SessionFactory, None, "local", settings)
+        return await run_graph(SessionFactory, None, "local", settings, goal)
     runtime = load_runtime()
     run = PipelineRun(
         id=str(uuid.uuid4()),
@@ -608,7 +854,11 @@ async def handle_telegram_text(text: str, chat_id: str) -> str:
             from app.review import apply_review
 
             action = "approve" if command == "/approve" else "reject"
-            apply_review(session, item, action, "telegram", actor="operator", channel="telegram")
+            try:
+                apply_review(session, item, action, "telegram", actor="operator", channel="telegram")
+            except GuardrailViolation as exc:
+                session.rollback()
+                return f"Cannot {action} {item.public_id} from status {item.status} ({exc.verdict.rule.replace('_', ' ')}). Nothing changed."
             return f"{item.public_id} is {item.status}. Nothing was sent externally."
         if command == "/outreach":
             item = session.scalar(select(Opportunity).where(Opportunity.public_id == argument))
@@ -624,6 +874,10 @@ async def handle_telegram_text(text: str, chat_id: str) -> str:
                 body=f"Draft only. Observed context is stored on {item.public_id}. This message was not sent.",
                 sent=False,
             )
+            try:
+                require(check_status_transition(item.status, "outreach_drafted", "operator"))
+            except GuardrailViolation:
+                return "That lead cannot be drafted from its current status. Nothing was created."
             item.status = "outreach_drafted"
             session.add(draft)
             session.commit()

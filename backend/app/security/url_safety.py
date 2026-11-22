@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
@@ -25,6 +26,11 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
     ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("64:ff9b::/96"),   # NAT64
+    ipaddress.ip_network("64:ff9b:1::/48"),  # local-use NAT64
+    ipaddress.ip_network("2002::/16"),       # 6to4
+    ipaddress.ip_network("2001::/32"),       # Teredo
+    ipaddress.ip_network("100::/64"),        # discard-only
 ]
 
 BLOCKED_HOSTS = {
@@ -47,6 +53,9 @@ class CheckedURL:
 
 
 def _blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None and _blocked_ip(mapped):
+        return True
     if (
         ip.is_private
         or ip.is_loopback
@@ -113,3 +122,28 @@ async def fetch_public(url: str, *, timeout: float = 20.0, max_redirects: int = 
                 continue
             return response
     raise UnsafeURL("Too many redirects")
+
+
+async def acheck_url(url: str, *, resolve=None) -> CheckedURL:
+    """check_url without blocking the event loop (DNS lookups run in a worker thread)."""
+    return await asyncio.to_thread(check_url, url, resolve=resolve or socket.getaddrinfo)
+
+
+def pinned_request(checked: CheckedURL, ip: str) -> tuple[str, dict, dict]:
+    """Rewrite a checked URL to connect to one validated IP while keeping the original name for Host and TLS.
+
+    Resolving again at connect time would let a hostile DNS server answer with a private address the second time
+    (DNS rebinding). Connecting to the address that passed the check closes that gap. For https, the original
+    hostname is sent as SNI and is what the certificate is verified against.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(checked.url)
+    host = parts.hostname or checked.host
+    literal = f"[{ip}]" if ":" in ip else ip
+    netloc = literal + (f":{parts.port}" if parts.port else "")
+    pinned = urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
+    default_port = 443 if parts.scheme == "https" else 80
+    host_header = host if (not parts.port or parts.port == default_port) else f"{host}:{parts.port}"
+    extensions = {"sni_hostname": host} if parts.scheme == "https" else {}
+    return pinned, {"Host": host_header}, extensions

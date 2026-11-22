@@ -37,22 +37,44 @@
     "Enterprise software",
     "Climate technology"
   ],
-  "countries": ["United States", "United Kingdom", "Canada", "Europe", "India", "Singapore", "Australia"],
-  "schedule": {"hour": 18, "minute": 0, "timezone": "Asia/Kolkata"},
+  "countries": [
+    "United States",
+    "United Kingdom",
+    "Canada",
+    "Europe",
+    "India",
+    "Singapore",
+    "Australia"
+  ],
+  "schedule": {
+    "hour": 18,
+    "minute": 0,
+    "timezone": "Asia/Kolkata"
+  },
   "models": {
     "extraction": "openai/gpt-4.1-mini",
     "research": "openai/gpt-4.1-mini",
     "technical": "openai/gpt-4.1-mini",
     "qualification": "openai/gpt-4.1-mini",
-    "qa": "openai/gpt-4.1-mini"
+    "qa": "openai/gpt-4.1-mini",
+    "agent": "openai/gpt-4.1-mini",
+    "orchestrator": "openai/gpt-4.1-mini",
+    "strategy": "openai/gpt-4.1-mini"
   },
-  "model_fallbacks": ["openai/gpt-4o-mini", "google/gemini-2.5-flash"],
+  "model_fallbacks": [
+    "openai/gpt-4o-mini",
+    "google/gemini-2.5-flash"
+  ],
   "fetch_caps": {
     "hn_hits": 40,
     "rss_per_feed": 12,
     "github_hits": 8,
     "crawl_queries": 1,
-    "crawl_pages": 1
+    "crawl_pages": 1,
+    "hn_hiring_comments": 40,
+    "focus_feed_items": 15,
+    "name_llm_titles": 60,
+    "job_board_items": 30
   },
   "scoring_v2": {
     "business_signal": {
@@ -87,5 +109,9 @@
       "unsupported_service_delta": 0,
       "none": 0
     }
+  },
+  "focus": {
+    "term": "fintech",
+    "sector": "fintech"
   }
 }

@@ -3,7 +3,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: goip
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: goip
     ports:
       - "127.0.0.1:5433:5432"
@@ -16,29 +16,44 @@ services:
       retries: 20
 
   api:
-    # Optional containerised API: docker compose --profile container up --build
-    # Needs a network where the image build can reach PyPI (a TLS-inspecting proxy needs its CA).
+    # Containerised API: scripts/docker-up.sh   (or: docker compose --profile container up --build)
     profiles: ["container"]
-    build: .
+    build:
+      context: .
+      secrets:
+        - corp_ca
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     env_file: .env
     environment:
       # Container-side overrides of the host-side values in .env
       GOIP_BIND_HOST: 0.0.0.0
       # Default: the compose postgres. To reuse a Postgres already on the host, set
       # GOIP_DOCKER_DB_URL=postgresql+psycopg://goip:PASSWORD@host.docker.internal:5433/goip
-      GOIP_DATABASE_URL: ${GOIP_DOCKER_DB_URL:-postgresql+psycopg://goip:${POSTGRES_PASSWORD:-change-me}@postgres:5432/goip}
+      GOIP_DATABASE_URL: ${GOIP_DOCKER_DB_URL:-postgresql+psycopg://goip:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/goip}
       SWITCH_BASE_URL: http://host.docker.internal:50990
       SWITCH_GATEWAY_URL: http://host.docker.internal:50989
       SWITCH_ENV_FILE: ""
+      GOIP_USE_SYSTEM_CERTS: "false"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:8001:8001"
     volumes:
       - ./data:/app/data
+      - ./config:/app/config
+      # Optional corporate root certificate (public). Empty file = none.
+      - ./certs/corp-ca.pem:/etc/goip/corp-ca.pem:ro
+
+secrets:
+  corp_ca:
+    file: ./certs/corp-ca.pem
 
 volumes:
   goip-pg:

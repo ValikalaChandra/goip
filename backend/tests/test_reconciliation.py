@@ -154,3 +154,42 @@ def test_commercial_intent_stays_separate_from_a_launch():
     assert explicit["classification"] == "explicit_external"
     empty = assess_commercial_intent([""])
     assert empty["classification"] == "unknown"
+
+
+def _co(i, name, domain=None):
+    from app.discovery.extract import normalize_name
+
+    return {"id": i, "name": name, "normalized_name": normalize_name(name), "domain": domain}
+
+
+def _classify(title, url, companies, linked=()):
+    return classify_signal(title=title, identity_hint="", source_url=url, companies=companies, linked_urls=set(linked))
+
+
+def test_every_class_explains_itself_with_checks_candidate_and_next_step():
+    cos = [_co("c1", "Acme", "acme.io"), _co("c2", "Acme Labs", None)]
+    cases = {
+        "confirmed_match": _classify("Acme launches x", "https://acme.io/blog/x", cos),
+        "probable_match": _classify("Acme raises $20M Series A", "https://techcrunch.com/a", [_co("c1", "Acme")]),
+        "ambiguous_match": _classify("Investors back Acme in a crowded market", "https://techcrunch.com/b", [_co("c1", "Acme")]),
+        "unmatched": _classify("Markets move on rate news", "https://techcrunch.com/c", cos),
+        "duplicate_signal": _classify("Acme raises", "https://techcrunch.com/a", cos, linked={"https://techcrunch.com/a"}),
+    }
+    for expected, result in cases.items():
+        assert result["classification"] == expected
+        r = result["reasoning"]
+        assert r["headline"] and r["class_meaning"] and r["to_confirm"] and len(r["checks"]) >= 1
+        assert all(c["status"] in {"pass", "fail", "info", "warn"} and c["detail"] for c in r["checks"])
+    assert cases["confirmed_match"]["reasoning"]["candidate"]["basis"] == "domain"
+    prob = cases["probable_match"]["reasoning"]
+    assert prob["candidate"]["name"] == "Acme" and prob["candidate"]["basis"] == "name"
+    assert "publisher" in prob["why_not_higher"] and prob["host_is_publisher"] is True
+    assert "identity" in prob["why_not_higher"] or "name match" in prob["why_not_higher"].lower()
+    assert cases["unmatched"]["reasoning"]["candidate"] is None and cases["unmatched"]["reasoning"]["why_not_higher"]
+
+
+def test_ambiguous_domain_lists_the_alternatives():
+    cos = [_co("c1", "Foo", "shared.io"), _co("c2", "Bar", "shared.io")]
+    result = _classify("Something happened", "https://shared.io/news", cos)
+    assert result["classification"] == "ambiguous_match" and result["candidate_company_id"] is None
+    assert {a["name"] for a in result["reasoning"]["alternatives"]} == {"Foo", "Bar"}

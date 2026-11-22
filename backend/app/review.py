@@ -56,6 +56,9 @@ def apply_review(
     reason = (note or "").strip() or default_reason
     current = latest_evaluation(session, opportunity.id)
     previous = opportunity.status
+    from app.guardrails import check_status_transition, require
+
+    require(check_status_transition(previous, status, actor))
     opportunity.status = status
     opportunity.status_reason = reason
     if action == "approve":

@@ -33,8 +33,13 @@ UNTRUSTED_FENCE = (
 )
 
 
+_FENCE_MARKER = re.compile(r"-{3,}\s*(END\s+)?UNTRUSTED\s+SOURCE\s+DATA\s*-{3,}", re.I)
+
+
 def fence_untrusted(body: str, limit: int = 8000) -> str:
     clipped = (body or "").replace("\x00", "")[:limit]
+    # Scraped text must not be able to close the fence early and speak as the instructions.
+    clipped = _FENCE_MARKER.sub("[marker removed]", clipped)
     return UNTRUSTED_FENCE.format(body=clipped)
 
 

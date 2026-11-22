@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>GOIP · Opportunity desk</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/theme.css?v=20261122k">
+  <link rel="stylesheet" href="/styles.css?v=20261122k">
+</head>
+<body>
+  <a class="skip" href="#view">Skip to content</a>
+
+  <section id="login-screen" aria-labelledby="login-title">
+    <div id="login-bg" aria-hidden="true"></div>
+    <form id="login" class="login-card">
+      <div class="brand big"><span class="mark" aria-hidden="true">G</span><span>GOIP</span></div>
+      <p class="eyebrow">Local operator</p>
+      <h1 id="login-title">Opportunity desk</h1>
+      <p class="muted">Public signals in, a sourced shortlist out. Nothing on this page contacts a company.</p>
+      <label class="sr-only" for="token">Operator token</label>
+      <input id="token" type="password" autocomplete="current-password" placeholder="Operator token" required>
+      <button class="primary" type="submit">Unlock the desk</button>
+      <p class="muted hint">The token is <span class="mono">GOIP_API_TOKEN</span> in <span class="mono">goip/.env</span>.</p>
+      <p id="login-error" class="bad" role="alert"></p>
+      <a class="back" href="/">About GOIP</a>
+    </form>
+  </section>
+
+  <div id="app" class="app-frame hidden">
+    <aside class="side">
+      <div class="brand"><span class="mark" aria-hidden="true">G</span><div><strong>GOIP</strong><span>Opportunity desk</span></div></div>
+      <nav aria-label="Primary">
+        <button data-view="overview" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 1 18 0M12 12l5-4M12 21v-2M5.6 18.4 7 17M18.4 18.4 17 17"/></svg>Overview</button>
+        <button data-view="explorer"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Opportunities</button>
+        <button data-view="agents"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.2"/><path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6"/><path d="M3 9h2M19 9h2M12 2v1.5"/></svg>Agents</button>
+        <button data-view="reconciliation"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.3 7l7.4 3.6M8.3 17l7.4-3.6"/></svg>Reconciliation</button>
+        <button data-view="activity"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>Switch room</button>
+        <button data-view="sources"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>Sources</button>
+        <button data-view="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</button>
+      </nav>
+      <div class="side-foot">
+        <p class="chip"><span id="switch-dot" class="dot"></span><span id="switch-label">Checking Switch</span></p>
+        <a href="/">About GOIP</a>
+      </div>
+    </aside>
+    <div class="shell">
+      <header class="top">
+        <div>
+          <p class="eyebrow">Evidence first · a person approves every step</p>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="top-actions">
+          <label class="sr-only" for="goal">What are you looking for?</label>
+          <input id="goal" class="goal" maxlength="300" placeholder="What are you looking for? e.g. freelance AI jobs in fintech" autocomplete="off">
+          <button id="logout" class="btn ghost btn-sm" type="button">Lock</button>
+          <button id="run" class="primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l12-7.5z"/></svg>Run research</button>
+        </div>
+      </header>
+      <main id="view" tabindex="-1" aria-live="polite"></main>
+    </div>
+  </div>
+
+  <script src="/vendor/gsap.min.js"></script>
+  <script src="/vendor/ScrollTrigger.min.js"></script>
+  <script src="/vendor/lenis.min.js"></script>
+  <script src="/vendor/motion.js"></script>
+  <script src="/vendor/three.min.js"></script>
+  <script src="/vendor/vanta.net.min.js"></script>
+  <script src="/fx.js?v=20261122k"></script>
+  <script src="/evidence-format.js?v=20261122k"></script>
+  <script src="/app.js?v=20261122k"></script>
+</body>
+</html>

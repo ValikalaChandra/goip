@@ -16,6 +16,10 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
+from app.agents import memory
+from app.agents.format import assessment_card, card, plan_card, stage_line
+from app.agents.llm import OpenRouterLLM
+from app.agents.orchestrator import plan_run, reflect_run
 from app.agents.team import SPECS, Team
 from app.agents.toolbox import ToolBox
 from app.config import Settings, get_settings, load_runtime
@@ -23,6 +27,7 @@ from app.db import PipelineRun, utcnow
 from app.discovery.sources import fetch_github
 from app.guardrails import AGENT_TOOLS, Budget, BudgetExceeded, GuardrailViolation
 from app.observability import traced
+from app.observability.tracing import tracing_scope
 from app.pipeline import attach_github, discover, qualify, quality_check, research
 
 log = logging.getLogger("goip.graph")
@@ -33,6 +38,8 @@ STAGE_TIMEOUTS = {"discover": 300, "research": 900, "technical": 180, "qualify":
 
 class RunState(TypedDict, total=False):
     run_id: str
+    goal: str
+    plan: dict
     company_ids: list[str]
     halted: str
     log: Annotated[list[dict], operator.add]
@@ -88,23 +95,36 @@ def _node(stage: str):
         try:
             result, update = await asyncio.wait_for(getattr(ctx.team, stage)(dict(state)), STAGE_TIMEOUTS[stage])
         except asyncio.TimeoutError:
-            await _mirror(ctx, spec.name, f"{stage} timed out. The run is partial.")
+            await _mirror(ctx, spec.name, card(f"{spec.name} · timed out", lead=f"The {stage} stage took too long, so the run stops as partial.", note="Nothing was padded or sent."))
             return {"halted": f"{stage}:stage_timeout", "log": [{"stage": stage, "ok": False, "why": "stage_timeout"}]}
         except GuardrailViolation as exc:
             v = exc.verdict
-            await _mirror(ctx, spec.name, f"Guardrail stopped {stage}: {v.layer}/{v.rule}. {v.detail[:200]}")
+            await _mirror(ctx, spec.name, card(f"Guardrail stopped · {stage}", fields=[("Layer", v.layer), ("Rule", v.rule.replace("_", " "))], lead=v.detail[:200] or None, note="The run stops as partial instead of continuing."))
             return {"halted": f"{stage}:{v.rule}", "log": [{"stage": stage, "ok": False, "why": f"{v.layer}/{v.rule}"}]}
         entry = {"stage": stage, "ok": result.ok, "steps": result.steps, "summary": result.summary[:300]}
-        await _mirror(ctx, spec.name, f"{stage}: {result.summary[:500]}")
+        await _mirror(ctx, spec.name, stage_line(stage, result.summary, mode=ctx.team.modes.get(stage), note=ctx.team.notes.get(stage)))
         if not result.ok:
             failed = next((v for v in result.verdicts if v.blocked), None)
             rule = failed.rule if failed else "verify_failed"
-            await _mirror(ctx, spec.name, f"Self-check failed for {stage}: {rule}. {(failed.detail if failed else '')[:200]}")
+            await _mirror(ctx, spec.name, card(f"Self-check failed · {stage}", fields=[("Check", rule.replace("_", " "))], lead=(failed.detail if failed else "")[:200] or None, note="The run stops as partial."))
             entry["why"] = rule
             return {"halted": f"{stage}:{rule}", "log": [entry]}
         return {**update, "log": [entry]}
 
     return node
+
+
+async def _plan(state: RunState) -> dict:
+    """The orchestrator turns the operator's request into a plan for this run."""
+    ctx = _CONTEXTS[state["run_id"]]
+    plan = await plan_run(ctx.team, state.get("goal") or "")
+    ctx.team.plan = plan
+    memory.note_decision(
+        ctx.session, state["run_id"], "goip-orchestrator", "plan", plan.mode,
+        "Plan: focus " + (plan.focus or "all sectors") + "; start with " + (", ".join(plan.prefer) or "the discovery agent's choice") + ". " + plan.notes,
+    )
+    await _mirror(ctx, "goip-orchestrator", plan_card(plan))
+    return {"plan": plan.as_dict()}
 
 
 async def _halt(state: RunState) -> dict:
@@ -115,12 +135,16 @@ async def _halt(state: RunState) -> dict:
     run.error = state.get("halted", "halted")[:500]
     run.finished_at = utcnow()
     ctx.session.commit()
-    await _mirror(ctx, "goip-orchestrator", f"Run {state['run_id']} stopped as partial: {run.error}. Nothing was padded or sent.")
+    await _mirror(ctx, "goip-orchestrator", card(f"Run `{state['run_id'][:8]}` · partial", lead=f"Stopped early: {run.error}.", note="Nothing was padded or sent."))
     return {}
 
 
 async def _finish(state: RunState) -> dict:
     ctx = _CONTEXTS[state["run_id"]]
+    run = ctx.session.get(PipelineRun, state["run_id"])
+    assessment = await reflect_run(ctx.team, dict(run.counts or {}), ctx.team.judged, dict(ctx.team.modes))
+    memory.note_decision(ctx.session, state["run_id"], "goip-orchestrator", "reflect", assessment["mode"], assessment["assessment"])
+    await _mirror(ctx, "goip-orchestrator", assessment_card(state["run_id"], assessment, dict(ctx.team.modes)))
     if ctx.runtime is not None and ctx.runtime.connected:
         await ctx.runtime._finish(state["run_id"])
     else:
@@ -150,9 +174,11 @@ def build_graph(checkpointer=None):
     graph = StateGraph(RunState)
     for stage in STAGES:
         graph.add_node(stage, _node(stage))
+    graph.add_node("plan", _plan)
     graph.add_node("finish", _finish)
     graph.add_node("halt", _halt)
-    graph.add_edge(START, STAGES[0])
+    graph.add_edge(START, "plan")
+    graph.add_edge("plan", STAGES[0])
     order = [*STAGES[1:], "finish"]
     for current, nxt in zip(STAGES, order):
         graph.add_conditional_edges(current, _route(nxt), {nxt: nxt, "halt": "halt"})
@@ -169,8 +195,13 @@ def _pg_url(url: str) -> str | None:
     return None
 
 
+async def run_graph(session_factory, runtime=None, trigger: str = "manual", settings: Settings | None = None, goal: str = "", llm=None) -> str:
+    with tracing_scope():
+        return await _run_graph_traced(session_factory, runtime, trigger, settings, goal, llm)
+
+
 @traced("goip-run", run_type="chain")
-async def run_graph(session_factory, runtime=None, trigger: str = "manual", settings: Settings | None = None) -> str:
+async def _run_graph_traced(session_factory, runtime=None, trigger: str = "manual", settings: Settings | None = None, goal: str = "", llm=None) -> str:
     settings = settings or get_settings()
     cfg = load_runtime()
     run_id = str(uuid.uuid4())
@@ -189,7 +220,8 @@ async def run_graph(session_factory, runtime=None, trigger: str = "manual", sett
     session.commit()
     budget = Budget()
     async with httpx.AsyncClient(follow_redirects=False, headers={"User-Agent": "GOIP/0.1"}) as http:
-        team = Team(session=session, http=http, settings=settings, run_id=run_id, boxes=_boxes(budget), budget=budget)
+        team = Team(session=session, http=http, settings=settings, run_id=run_id, boxes=_boxes(budget), budget=budget,
+                    llm=llm or OpenRouterLLM(http, settings, budget), goal=goal)
         _CONTEXTS[run_id] = _Context(team, runtime, session)
         config = {"configurable": {"thread_id": run_id}, "tags": [f"run:{run_id}"], "metadata": {"trigger": trigger}}
         try:
@@ -199,9 +231,9 @@ async def run_graph(session_factory, runtime=None, trigger: str = "manual", sett
 
                 async with AsyncPostgresSaver.from_conn_string(pg) as saver:
                     await saver.setup()
-                    await build_graph(saver).ainvoke({"run_id": run_id, "log": []}, config)
+                    await build_graph(saver).ainvoke({"run_id": run_id, "goal": goal, "log": []}, config)
             else:
-                await build_graph().ainvoke({"run_id": run_id, "log": []}, config)
+                await build_graph().ainvoke({"run_id": run_id, "goal": goal, "log": []}, config)
         except BudgetExceeded as exc:
             run = session.get(PipelineRun, run_id)
             run.status = "partial"

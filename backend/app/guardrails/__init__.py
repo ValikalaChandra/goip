@@ -20,6 +20,7 @@ from app.guardrails.core import (
     check_tool_call,
     check_grounded_output,
     redact_pii,
+    redact_secrets,
     require,
 )
 
@@ -38,5 +39,6 @@ __all__ = [
     "check_tool_call",
     "check_grounded_output",
     "redact_pii",
+    "redact_secrets",
     "require",
 ]

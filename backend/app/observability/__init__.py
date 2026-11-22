@@ -4,7 +4,8 @@ from app.observability.tracing import (
     configure_tracing,
     record_verdict,
     tracing_enabled,
+    tracing_scope,
     traced,
 )
 
-__all__ = ["configure_tracing", "record_verdict", "tracing_enabled", "traced"]
+__all__ = ["configure_tracing", "record_verdict", "tracing_enabled", "tracing_scope", "traced"]

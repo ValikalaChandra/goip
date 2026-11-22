@@ -27,3 +27,7 @@ docs/**/*.gif
 docs/**/*.webm
 docs/**/project_source/
 docs/**/voiceover/
+# corporate root certificate (public, but machine-specific)
+certs/*.pem
+!certs/.gitkeep
+!certs/README.md

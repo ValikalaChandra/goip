@@ -60,6 +60,8 @@ class Signal(Base):
     verification_status: Mapped[str] = mapped_column(String(40), default="unverified")
     claim_kind: Mapped[str] = mapped_column(String(40), default="observed")
     agent_name: Mapped[str] = mapped_column(String(80), default="goip-discovery")
+    # A reviewer-model verdict on whether this posting is a company offering a contract. Never a score.
+    classification: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     company: Mapped[Company | None] = relationship(back_populates="signals")
 
 
@@ -160,6 +162,37 @@ def _evaluation_versions_are_insert_only(_mapper, _connection, _target) -> None:
 @event.listens_for(EvaluationVersion, "before_delete")
 def _evaluation_versions_are_not_deleted(_mapper, _connection, _target) -> None:
     raise RuntimeError("evaluation versions are immutable")
+
+
+class AgentMemory(Base):
+    """What an agent has learned and should carry into later runs: source yields, operator preferences, lessons."""
+
+    __tablename__ = "agent_memory"
+    __table_args__ = (UniqueConstraint("agent", "kind", "key", name="uq_agent_memory"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent: Mapped[str] = mapped_column(String(80), index=True)
+    kind: Mapped[str] = mapped_column(String(40), index=True)
+    key: Mapped[str] = mapped_column(String(200))
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentStep(Base):
+    """One step of an agent's reasoning: what it thought, which tool it chose, and what it saw."""
+
+    __tablename__ = "agent_steps"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    agent: Mapped[str] = mapped_column(String(80))
+    stage: Mapped[str] = mapped_column(String(40), default="")
+    step: Mapped[int] = mapped_column(Integer, default=0)
+    mode: Mapped[str] = mapped_column(String(24), default="llm")  # llm | fallback
+    thought: Mapped[str] = mapped_column(Text, default="")
+    tool: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    args: Mapped[dict] = mapped_column(JSON, default=dict)
+    observation: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class StatusEvent(Base):
@@ -303,6 +336,9 @@ def _ensure_history_columns(engine) -> None:
     """Add history columns to databases created before schema 003. Does not drop data."""
     json_type = "JSON" if engine.dialect.name == "postgresql" else "TEXT"
     additions = {
+        "signals": {
+            "classification": json_type,
+        },
         "evaluation_versions": {
             "previous_evaluation_id": "VARCHAR(36)",
             "config_version": "VARCHAR(80)",
